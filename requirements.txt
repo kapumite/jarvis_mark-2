@@ -1,0 +1,14 @@
+# ── Core ──────────────────────────────────────────────────────────────────────
+openai>=1.30.0          # OpenAI-compatible client for Ollama
+pyttsx3>=2.90           # Offline TTS
+SpeechRecognition>=3.10 # STT wrapper
+pyaudio>=0.2.14         # Microphone access (required by SpeechRecognition)
+colorama>=0.4.6         # Terminal colours
+
+# ── Desktop automation ────────────────────────────────────────────────────────
+pygetwindow>=0.0.9      # Window focus / detection
+pyautogui>=0.9.54       # Keyboard / mouse / media keys
+pyperclip>=1.8.2        # Clipboard paste (for Cyrillic type_text)
+
+# ── Optional: load API keys / config from .env ────────────────────────────────
+python-dotenv>=1.0.0

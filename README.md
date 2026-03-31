@@ -87,6 +87,14 @@ pip install -r requirements.txt
 > sudo apt-get install portaudio19-dev
 > pip install pyaudio
 > ```
+## 4\. установка ollama
+```bash
+irm https://ollama.com/install.ps1 | iex
+```
+```bash
+ollama run qwen2.5:7b
+```
+так же можно установить любого другого ии-ассистента но нужно всё прописывать
 
 ## Запуск
 

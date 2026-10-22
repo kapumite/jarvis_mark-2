@@ -1,60 +1,30 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║              J.A.R.V.I.S  Mark-2  —  Action-Based Agent System             ║
-║         Path : C:\\Users\\P.E.K.K.A\\Desktop\\jarvis\\jarvis.py              ║
-║         LLM  : Ollama  qwen2.5:7b  (http://localhost:11434/v1)              ║
-║         OS   : Windows 10 / 11                                              ║
+║              J.A.R.V.I.S  —  Action-Based Agent System                       ║
+║         Local LLM via Ollama · Windows 10/11 · Voice + Hotkey + Text         ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 
-Architecture Overview
-─────────────────────
-  Microphone
-      │
-   STTEngine  →  raw text
-      │
-  WakeWordFilter
-      │
-  AgentCore.handle(text)
-      │
-  LLMPlanner.plan(text)          ← sends text + tool signatures to Ollama
-      │                             model returns JSON: { "speech": "...",
-      │                                                   "actions": [...] }
-  ActionDispatcher.run(plan)
-      │
-  ToolBox methods  ←─── strictly typed, no eval(), no exec()
-      │
-  TTSEngine.speak(speech_text)   ← non-blocking, always called
-
-Safety model
-────────────
-  The LLM *describes* what to do using a closed set of named tools.
-  No code is generated or eval'd.  The dispatcher maps tool names to
-  Python methods.  Any unknown tool name is silently ignored with a
-  warning, not executed.
-
-Setup
-─────
-  pip install openai pyttsx3 SpeechRecognition pyaudio pygetwindow pyautogui colorama
-  (Run: ollama serve  and  ollama pull qwen2.5:7b  before starting)
-  python jarvis.py
-"""
-
-# ── Standard library ──────────────────────────────────────────────────────────
 import os
 import re
 import sys
 import json
 import time
+import copy
 import queue
 import shutil
 import signal
+import ctypes
 import logging
+import argparse
 import threading
 import subprocess
+import urllib.parse
+import urllib.request
 from datetime import datetime
-from typing import Any, Optional
+from logging.handlers import RotatingFileHandler
+from typing import Any, Optional, Iterable
 
-# ── Third-party (hard dependencies) ──────────────────────────────────────────
+# ── Hard dependencies ────────────────────────────────────────────────────────
 try:
     import speech_recognition as sr
     import pyttsx3
@@ -62,133 +32,228 @@ try:
     from colorama import Fore, Style, init as colorama_init
 except ImportError as exc:
     print(f"\n[FATAL] Missing package: {exc}")
-    print("Run:  pip install openai pyttsx3 SpeechRecognition pyaudio colorama\n")
+    print("pip install openai pyttsx3 SpeechRecognition pyaudio colorama\n")
     sys.exit(1)
 
-# ── Third-party (soft — degrade gracefully if absent) ────────────────────────
+colorama_init(autoreset=True)
+
+# ── Soft dependencies ────────────────────────────────────────────────────────
 try:
     import pygetwindow as gw
     import pyautogui
-    pyautogui.FAILSAFE = False
     GUI_OK = True
 except ImportError:
     GUI_OK = False
 
+try:
+    import pyperclip
+    PYPERCLIP_OK = True
+except ImportError:
+    PYPERCLIP_OK = False
+
+try:
+    import psutil
+    PSUTIL_OK = True
+except ImportError:
+    PSUTIL_OK = False
+
+try:
+    import winsound
+    WINSOUND_OK = True
+except ImportError:
+    WINSOUND_OK = False
+
+try:
+    from pynput import keyboard as pynput_kb
+    PYNPUT_OK = True
+except ImportError:
+    PYNPUT_OK = False
+
+
 # ══════════════════════════════════════════════════════════════════════════════
-#  §0  CONFIGURATION
+#  §0  CONFIG — auto-generated, editable
 # ══════════════════════════════════════════════════════════════════════════════
 
-colorama_init(autoreset=True)
+_HOME    = os.path.expanduser("~")
+_LOCAL   = os.environ.get("LOCALAPPDATA", r"C:\Users\%USERNAME%\AppData\Local")
+_ROAM    = os.environ.get("APPDATA",      r"C:\Users\%USERNAME%\AppData\Roaming")
+_PF      = os.environ.get("ProgramFiles",     r"C:\Program Files")
+_PF86    = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
 
-# ── Ollama ────────────────────────────────────────────────────────────────────
-OLLAMA_BASE_URL = "http://localhost:11434/v1"
-OLLAMA_MODEL    = "qwen2.5:7b"
-LLM_TIMEOUT     = 45          # seconds; Ollama on local GPU can be slow
-MAX_HISTORY     = 12          # conversation pairs kept in context
-
-# ── Wake words ────────────────────────────────────────────────────────────────
-WAKE_WORDS: tuple[str, ...] = ("джарвис", "jarvis")
-
-# ── Speech recognition ────────────────────────────────────────────────────────
-LISTEN_LANG      = "ru-RU"
-ENERGY_THRESHOLD = 300
-PAUSE_THRESHOLD  = 0.85
-PHRASE_LIMIT     = 10.0
-
-# ── TTS ───────────────────────────────────────────────────────────────────────
-TTS_RATE   = 165
-TTS_VOLUME = 1.0
-
-# ── Paths (user-specific) ─────────────────────────────────────────────────────
-USER_HOME   = r"C:\Users\P.E.K.K.A"
-DESKTOP     = os.path.join(USER_HOME, "Desktop")
-
-APP_PATHS: dict[str, str] = {
-    "yandex music":  rf"{USER_HOME}\AppData\Local\Programs\YandexMusicMod\Яндекс Музыка.exe",
-    "яндекс музыка": rf"{USER_HOME}\AppData\Local\Programs\YandexMusicMod\Яндекс Музыка.exe",
-    "steam":         r"C:\Program Files (x86)\Steam\steam.exe",
-    "telegram":      rf"{USER_HOME}\AppData\Roaming\Telegram Desktop\Telegram.exe",
-    "firefox":       r"C:\Program Files\Mozilla Firefox\firefox.exe",
-    "chrome":        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-    "vs code":       r"C:\Users\P.E.K.K.A\AppData\Local\Programs\Microsoft VS Code\Code.exe",
-    "discord":       rf"{USER_HOME}\AppData\Local\Discord\Update.exe",
-    "spotify":       rf"{USER_HOME}\AppData\Roaming\Spotify\Spotify.exe",
+DEFAULT_APPS: dict[str, str] = {
+    "yandex music":  os.path.join(_LOCAL, "Programs", "YandexMusicMod", "Яндекс Музыка.exe"),
+    "яндекс музыка": os.path.join(_LOCAL, "Programs", "YandexMusicMod", "Яндекс Музыка.exe"),
+    "steam":         os.path.join(_PF86, "Steam", "steam.exe"),
+    "telegram":      os.path.join(_ROAM, "Telegram Desktop", "Telegram.exe"),
+    "firefox":       os.path.join(_PF, "Mozilla Firefox", "firefox.exe"),
+    "chrome":        os.path.join(_PF, "Google", "Chrome", "Application", "chrome.exe"),
+    "vs code":       os.path.join(_LOCAL, "Programs", "Microsoft VS Code", "Code.exe"),
+    "discord":       "discord:",       # protocol handler — спец-кейс
+    "spotify":       os.path.join(_ROAM, "Spotify", "Spotify.exe"),
     "notepad":       "notepad.exe",
     "explorer":      "explorer.exe",
     "calculator":    "calc.exe",
 }
 
-# ── Logging ───────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.WARNING,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
-log = logging.getLogger("JARVIS-Mk2")
+DEFAULT_CONFIG: dict = {
+    "ollama": {
+        "base_url":    "http://localhost:11434/v1",
+        "model":       "qwen2.5:7b",
+        "timeout":     45,
+        "max_history": 12,
+    },
+    "wake_words": ["джарвис", "jarvis"],
+    "stt": {
+        "lang":             "ru-RU",
+        "energy_threshold": 300,
+        "pause_threshold":  0.85,
+        "phrase_limit":     10.0,
+    },
+    "tts": {
+        "rate":  165,
+        "volume": 1.0,
+        "voice_hint": "ru",
+    },
+    "hotkey":              "ctrl+alt+j",
+    "hotkey_bypass_secs":  8.0,
+    "failsafe":            True,
+    "confirm_destructive": True,
+    "paths": {
+        "desktop": os.path.join(_HOME, "Desktop"),
+        "apps":    DEFAULT_APPS,
+    },
+    "logging": {
+        "file":      "jarvis.log",
+        "level":     "WARNING",
+        "max_bytes": 5_242_880,
+        "backups":   3,
+    },
+}
+
+_CFG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+CFG: dict = {}
+
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    out = copy.deepcopy(base)
+    for k, v in override.items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def load_config(explicit_path: Optional[str] = None) -> dict:
+    path = explicit_path or _CFG_PATH
+    if not os.path.exists(path):
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(DEFAULT_CONFIG, f, ensure_ascii=False, indent=2)
+            print(Fore.YELLOW + f"[CFG] Created default config: {path}")
+        except Exception as e:
+            print(Fore.RED + f"[CFG] Cannot create default config: {e}")
+        return copy.deepcopy(DEFAULT_CONFIG)
+    try:
+        with open(path, encoding="utf-8") as f:
+            user_cfg = json.load(f)
+        return _deep_merge(DEFAULT_CONFIG, user_cfg)
+    except Exception as e:
+        print(Fore.RED + f"[CFG] Load error: {e}. Using defaults.")
+        return copy.deepcopy(DEFAULT_CONFIG)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  §1  TERMINAL UI
+#  §1  LOGGING
+# ══════════════════════════════════════════════════════════════════════════════
+
+log = logging.getLogger("JARVIS-Mk3")
+
+
+def setup_logging(cfg: dict) -> None:
+    lc = cfg.get("logging", {})
+    log.setLevel(getattr(logging, str(lc.get("level", "WARNING")).upper(), logging.WARNING))
+
+    fh = RotatingFileHandler(
+        lc.get("file", "jarvis.log"),
+        maxBytes=lc.get("max_bytes", 5_242_880),
+        backupCount=lc.get("backups", 3),
+        encoding="utf-8",
+    )
+    fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+    log.addHandler(fh)
+
+    ch = logging.StreamHandler(sys.stderr)
+    ch.setLevel(logging.ERROR)
+    ch.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    log.addHandler(ch)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  §2  TERMINAL UI
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _ts() -> str:
     return datetime.now().strftime("%H:%M:%S")
 
+
 def ui_banner():
     w = 72
     print(Fore.CYAN + Style.BRIGHT + "═" * w)
-    print(Fore.CYAN + Style.BRIGHT + "  J.A.R.V.I.S  Mark-2  —  Action-Based Agent")
-    print(Fore.CYAN + Style.DIM    + f"  Model: {OLLAMA_MODEL}  |  Endpoint: {OLLAMA_BASE_URL}")
+    print(Fore.CYAN + Style.BRIGHT + "  J.A.R.V.I.S  Mark-3  —  Action-Based Agent")
+    print(Fore.CYAN + Style.DIM    + f"  Model: {CFG['ollama']['model']}  |  Endpoint: {CFG['ollama']['base_url']}")
     print(Fore.CYAN + Style.BRIGHT + "═" * w)
 
-def ui_listen():    print(Fore.GREEN  + Style.BRIGHT + f"\n[{_ts()}] 🎤  Слушаю…")
-def ui_wake():      print(Fore.YELLOW + Style.BRIGHT + f"[{_ts()}] ✨  Активирован!")
-def ui_heard(t):    print(Fore.WHITE  + f"[{_ts()}] 👂  Распознано: " + Style.BRIGHT + f'"{t}"')
-def ui_plan(p):     print(Fore.MAGENTA+ f"[{_ts()}] 🧠  Планирование… ответ модели:")
-def ui_action(a):   print(Fore.BLUE   + Style.BRIGHT + f"[{_ts()}] ⚡  {a}")
+
+def ui_listen():  print(Fore.GREEN  + Style.BRIGHT + f"\n[{_ts()}] 🎤  Слушаю…")
+def ui_wake():    print(Fore.YELLOW + Style.BRIGHT + f"[{_ts()}] ✨  Активирован!")
+def ui_heard(t):  print(Fore.WHITE  + f"[{_ts()}] 👂  Распознано: " + Style.BRIGHT + f'"{t}"')
+def ui_plan():    print(Fore.MAGENTA+ f"[{_ts()}] 🧠  Планирование…")
+def ui_action(a): print(Fore.BLUE   + Style.BRIGHT + f"[{_ts()}] ⚡  {a}")
 def ui_speak(t):
     d = t if len(t) <= 110 else t[:107] + "…"
     print(Fore.CYAN + Style.BRIGHT + f"[{_ts()}] 🔊  JARVIS: " + Style.NORMAL + d)
-def ui_warn(m):     print(Fore.YELLOW + f"[{_ts()}] ⚠   {m}")
-def ui_error(m):    print(Fore.RED    + Style.BRIGHT + f"[{_ts()}] ✖   {m}")
-def ui_info(m):     print(Fore.WHITE  + Style.DIM    + f"[{_ts()}] ℹ   {m}")
-def ui_sep():       print(Fore.CYAN   + Style.DIM    + "─" * 72)
-def ui_json(d):     print(Fore.MAGENTA+ Style.DIM    + json.dumps(d, ensure_ascii=False, indent=2))
+def ui_warn(m):   print(Fore.YELLOW + f"[{_ts()}] ⚠   {m}")
+def ui_error(m):  print(Fore.RED    + Style.BRIGHT + f"[{_ts()}] ✖   {m}")
+def ui_info(m):   print(Fore.WHITE  + Style.DIM    + f"[{_ts()}] ℹ   {m}")
+def ui_sep():     print(Fore.CYAN   + Style.DIM    + "─" * 72)
+def ui_json(d):   print(Fore.MAGENTA+ Style.DIM    + json.dumps(d, ensure_ascii=False, indent=2))
+
+
+def beep(freq: int = 880, dur: int = 100) -> None:
+    if WINSOUND_OK:
+        try:
+            winsound.Beep(freq, dur)
+        except Exception:
+            pass
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  §2  TTS ENGINE  (dedicated thread — always non-blocking)
+#  §3  TTS ENGINE
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TTSEngine:
-    """
-    pyttsx3 runs in a dedicated daemon thread with a Queue.
-    speak()      → enqueue text, return immediately (non-blocking).
-    speak_sync() → enqueue and block until audio finishes.
-    """
-
-    def __init__(self):
+    def __init__(self, enabled: bool = True):
+        self._enabled = enabled
         self._q: queue.Queue[Optional[str]] = queue.Queue()
-        t = threading.Thread(target=self._worker, daemon=True, name="TTS-Worker")
-        t.start()
+        if enabled:
+            threading.Thread(target=self._worker, daemon=True, name="TTS-Worker").start()
 
     def _worker(self):
         try:
             engine = pyttsx3.init()
-            engine.setProperty("rate",   TTS_RATE)
-            engine.setProperty("volume", TTS_VOLUME)
+            engine.setProperty("rate",   CFG["tts"]["rate"])
+            engine.setProperty("volume", CFG["tts"]["volume"])
 
-            # Select Russian voice if available
-            for v in engine.getProperty("voices"):
+            hint = str(CFG["tts"].get("voice_hint", "ru")).lower()
+            for v in engine.getProperty("voices") or []:
                 langs = v.languages or []
-                if any("ru" in str(l).lower() for l in langs) \
-                        or "elena" in v.name.lower() \
-                        or "irina" in v.name.lower() \
-                        or "russian" in v.name.lower():
+                if any(hint in str(l).lower() for l in langs) or hint in v.name.lower():
                     engine.setProperty("voice", v.id)
                     ui_info(f"TTS voice: {v.name}")
                     break
             else:
-                ui_warn("Russian TTS voice not found — using system default.")
+                ui_warn("Russian voice not found — using system default.")
 
             while True:
                 text = self._q.get()
@@ -205,38 +270,49 @@ class TTSEngine:
             ui_error(f"TTS init failed: {e}")
 
     def speak(self, text: str) -> None:
-        """Non-blocking. Always call this after every LLM response."""
         ui_speak(text)
-        self._q.put(text)
+        if self._enabled:
+            self._q.put(text)
 
     def speak_sync(self, text: str) -> None:
-        """Blocking — used only for the startup greeting."""
         self.speak(text)
-        self._q.join()
+        if self._enabled:
+            self._q.join()
 
-    def stop(self):
-        self._q.put(None)
+    def stop(self) -> None:
+        if self._enabled:
+            self._q.put(None)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  §3  STT ENGINE
+#  §4  STT ENGINE  (mic or text)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class STTEngine:
-    def __init__(self):
-        self.rec = sr.Recognizer()
-        self.rec.energy_threshold        = ENERGY_THRESHOLD
-        self.rec.pause_threshold         = PAUSE_THRESHOLD
-        self.rec.dynamic_energy_threshold = True
+    def __init__(self, text_mode: bool = False):
+        self._text_mode = text_mode
         self._mic: Optional[sr.Microphone] = None
+        self.rec = sr.Recognizer()
+        stt = CFG["stt"]
+        self.rec.energy_threshold         = stt["energy_threshold"]
+        self.rec.pause_threshold          = stt["pause_threshold"]
+        self.rec.dynamic_energy_threshold = True
+
+        if text_mode:
+            ui_info("Text input mode active — no microphone.")
+            return
         try:
             self._mic = sr.Microphone()
             ui_info("Microphone initialised.")
         except OSError as e:
             ui_error(f"Microphone not found: {e}")
 
-    def calibrate(self):
-        if not self._mic:
+    @property
+    def available(self) -> bool:
+        return self._text_mode or self._mic is not None
+
+    def calibrate(self) -> None:
+        if self._text_mode or not self._mic:
             return
         ui_info("Calibrating ambient noise…")
         try:
@@ -247,15 +323,21 @@ class STTEngine:
             ui_warn(f"Calibration failed: {e}")
 
     def listen_once(self) -> Optional[str]:
+        if self._text_mode:
+            try:
+                val = input(Fore.GREEN + Style.BRIGHT + f"\n[{_ts()}] ⌨  > " + Style.RESET_ALL)
+                return val.strip() or None
+            except (EOFError, KeyboardInterrupt):
+                return None
+
         if not self._mic:
-            ui_error("Microphone unavailable.")
             return None
         try:
             with self._mic as src:
                 ui_listen()
                 audio = self.rec.listen(src, timeout=None,
-                                        phrase_time_limit=PHRASE_LIMIT)
-            return self.rec.recognize_google(audio, language=LISTEN_LANG).strip()
+                                        phrase_time_limit=CFG["stt"]["phrase_limit"])
+            return self.rec.recognize_google(audio, language=CFG["stt"]["lang"]).strip()
         except sr.WaitTimeoutError:
             return None
         except sr.UnknownValueError:
@@ -268,66 +350,84 @@ class STTEngine:
             ui_error(f"Mic OS error: {e}")
             return None
 
-    @property
-    def available(self) -> bool:
-        return self._mic is not None
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  §5  WIN32 MEDIA KEYS
+# ══════════════════════════════════════════════════════════════════════════════
+
+_VK = {
+    "playpause":  0xB3,
+    "nexttrack":  0xB0,
+    "prevtrack":  0xB1,
+    "volumeup":   0xAF,
+    "volumedown": 0xAE,
+    "volumemute": 0xAD,
+}
+
+
+def _press_vk(vk: int) -> None:
+    try:
+        user32 = ctypes.windll.user32
+        user32.keybd_event(vk, 0, 0, 0)
+        time.sleep(0.03)
+        user32.keybd_event(vk, 0, 2, 0)
+    except Exception as e:
+        log.warning("press_vk failed: %s", e)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  §4  TOOLBOX  —  closed set of safe desktop actions
+#  §6  TOOLBOX  (closed set of safe actions, auto-registered via @tool)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class ToolBox:
-    """
-    Every public method is a callable tool.  The ActionDispatcher maps
-    JSON tool names → ToolBox methods.  Nothing outside this class is
-    ever called by the dispatcher, so there is no code-injection surface.
+    _TOOLS: dict[str, dict] = {}
 
-    Tool signatures (what the LLM sees in its system prompt)
-    ─────────────────────────────────────────────────────────
-    launch_app(name)          – launch app by name from APP_PATHS registry
-    focus_or_launch(name)     – focus window if open, else launch
-    focus_window(title)       – bring an existing window to the front
-    close_app(name)           – terminate a process by image name
-    press_key(*keys)          – press one or more keys (hotkey if multiple)
-    type_text(text)           – type text into the active window
-    open_url(url, browser)    – navigate browser to URL (Ctrl+L → type → Enter)
-    create_folder(name)       – create folder on Desktop
-    delete_folder(name)       – delete folder/file on Desktop (to Recycle Bin via shell)
-    rename_item(old, new)     – rename file/folder on Desktop
-    media_play_pause()        – press Play/Pause media key
-    media_next()              – press Next Track media key
-    media_prev()              – press Previous Track media key
-    get_time()                – speak current time (returns string)
-    get_date()                – speak current date (returns string)
-    """
+    @staticmethod
+    def tool(name: str, args: list[str], desc: str, destructive: bool = False):
+        def deco(fn):
+            ToolBox._TOOLS[name] = {
+                "args": args, "desc": desc, "destructive": destructive,
+            }
+            return fn
+        return deco
 
-    # ── Helpers ───────────────────────────────────────────────────────────────
+    def __init__(self, tts: "TTSEngine"):
+        self._tts = tts
+        self._desktop = CFG["paths"]["desktop"]
+        self._apps    = {k.lower(): v for k, v in CFG["paths"]["apps"].items()}
+
+    # ── Helpers ──────────────────────────────────────────────────────────────
 
     @staticmethod
     def _resolve_app_path(name: str) -> Optional[str]:
-        """Look up an app path from APP_PATHS (case-insensitive)."""
-        return APP_PATHS.get(name.lower().strip())
+        return CFG["paths"]["apps"].get(name.lower().strip())
 
     @staticmethod
     def _find_windows(fragment: str) -> list:
-        """Return all open windows whose title contains fragment (case-insensitive)."""
         if not GUI_OK:
             return []
         try:
-            frag_l = fragment.lower()
+            frag = fragment.lower()
             return [w for w in gw.getAllWindows()
-                    if frag_l in w.title.lower() and w.title.strip()]
+                    if frag in w.title.lower() and w.title.strip()]
         except Exception:
             return []
 
     @staticmethod
-    def _popen(path: str, *extra_args: str) -> bool:
-        """Launch a process silently.  Returns True on success."""
-        cmd = [path] + list(extra_args)
+    def _popen(path: str, *extra: str) -> bool:
+        # protocol-handler: "discord:", "ms-settings:", "https://..."
+        if path.endswith(":") or "://" in path:
+            try:
+                os.startfile(path)
+                return True
+            except Exception as e:
+                ui_error(f"startfile error: {e}")
+                return False
+        cmd = [path, *extra]
         ui_action(f"Launching: {' '.join(cmd)}")
         try:
-            subprocess.Popen(cmd, creationflags=subprocess.CREATE_NO_WINDOW,
+            subprocess.Popen(cmd,
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                              close_fds=True)
             return True
         except FileNotFoundError:
@@ -337,38 +437,37 @@ class ToolBox:
             ui_error(f"Launch error: {e}")
             return False
 
-    # ── Tool: launch_app ──────────────────────────────────────────────────────
+    @staticmethod
+    def _normalize_keys(keys: Any) -> list[str]:
+        if isinstance(keys, str):
+            return [k.strip() for k in re.split(r"[+,]", keys) if k.strip()]
+        if isinstance(keys, (list, tuple)):
+            return [str(k).strip() for k in keys if str(k).strip()]
+        return []
 
+    # ── Launch / focus / close ───────────────────────────────────────────────
+
+    @tool("launch_app", ["name"], "launch an application by registry name")
     def launch_app(self, name: str) -> str:
-        """Launch an application by its registered name."""
         path = self._resolve_app_path(name)
         if path is None:
-            # Last resort: try running the name as a command (e.g. "notepad.exe")
             if self._popen(name):
                 return f"Запускаю {name}."
-            return f"Приложение «{name}» не найдено в реестре путей."
+            return f"Приложение «{name}» не найдено."
         if self._popen(path):
             return f"Запускаю {name}."
         return f"Не удалось запустить {name}."
 
-    # ── Tool: focus_or_launch ─────────────────────────────────────────────────
-
+    @tool("focus_or_launch", ["name"], "focus window if open, else launch app")
     def focus_or_launch(self, name: str) -> str:
-        """
-        If a window matching `name` is already open → bring it to front.
-        Otherwise → launch the app.
-        """
-        wins = self._find_windows(name)
-        if wins:
+        if self._find_windows(name):
             return self.focus_window(name)
         return self.launch_app(name)
 
-    # ── Tool: focus_window ────────────────────────────────────────────────────
-
+    @tool("focus_window", ["title"], "bring existing window to front by title fragment")
     def focus_window(self, title: str) -> str:
-        """Bring the first window whose title contains `title` to the foreground."""
         if not GUI_OK:
-            return "Модуль управления окнами недоступен (установите pygetwindow)."
+            return "Модуль управления окнами недоступен."
         wins = self._find_windows(title)
         if not wins:
             return f"Окно «{title}» не найдено."
@@ -381,41 +480,32 @@ class ToolBox:
             ui_action(f"Focused: {w.title[:60]}")
             return f"Переключаюсь на {title}."
         except Exception as e:
-            ui_error(f"focus_window error: {e}")
-            return f"Не удалось переключиться на {title}: {e}"
+            return f"Не удалось переключиться: {e}"
 
-    # ── Tool: close_app ───────────────────────────────────────────────────────
-
+    @tool("close_app", ["name"], "close an app gracefully, force if needed", destructive=True)
     def close_app(self, name: str) -> str:
-        """
-        Terminate a process by image name (e.g. "firefox.exe", "steam.exe").
-        Uses taskkill /F /IM <name>.
-        """
-        # Normalise: add .exe if not present
         exe = name if name.lower().endswith(".exe") else name + ".exe"
-        ui_action(f"taskkill /F /IM {exe}")
-        try:
-            result = subprocess.run(
-                ["taskkill", "/F", "/IM", exe],
-                capture_output=True, text=True,
-                creationflags=subprocess.CREATE_NO_WINDOW,
-            )
-            if result.returncode == 0:
-                return f"{name} завершён."
-            return f"Не удалось завершить {name}: {result.stderr.strip()}"
-        except Exception as e:
-            ui_error(f"close_app error: {e}")
-            return f"Ошибка при завершении {name}: {e}"
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        # graceful
+        r = subprocess.run(["taskkill", "/IM", exe],
+                           capture_output=True, text=True, creationflags=flags)
+        if r.returncode == 0:
+            return f"{name} закрыт."
+        # force
+        r = subprocess.run(["taskkill", "/F", "/IM", exe],
+                           capture_output=True, text=True, creationflags=flags)
+        if r.returncode == 0:
+            return f"{name} закрыт принудительно."
+        return f"Не удалось закрыть {name}: {r.stderr.strip()[:80]}"
 
-    # ── Tool: press_key ───────────────────────────────────────────────────────
+    # ── Keyboard / text ──────────────────────────────────────────────────────
 
-    def press_key(self, *keys: str) -> str:
-        """
-        Press one key or a hotkey combination.
-        Examples: press_key("enter")  /  press_key("ctrl", "l")
-        """
+    @tool("press_key", ["keys"], "press hotkey, e.g. ['ctrl','l'] or 'ctrl+l'")
+    def press_key(self, *keys) -> str:
         if not GUI_OK:
-            return "Модуль ввода клавиш недоступен (установите pyautogui)."
+            return "Модуль ввода клавиш недоступен."
+        if len(keys) == 1:
+            keys = tuple(self._normalize_keys(keys[0]))
         if not keys:
             return "Не указаны клавиши."
         ui_action(f"Keys: {' + '.join(keys)}")
@@ -427,644 +517,783 @@ class ToolBox:
             time.sleep(0.1)
             return "Клавиши нажаты."
         except Exception as e:
-            ui_error(f"press_key error: {e}")
-            return f"Ошибка нажатия клавиш: {e}"
+            return f"Ошибка нажатия: {e}"
 
-    # ── Tool: type_text ───────────────────────────────────────────────────────
-
+    @tool("type_text", ["text"], "type text into the currently active window")
     def type_text(self, text: str) -> str:
-        """Type text into the currently active window."""
         if not GUI_OK:
-            return "Модуль ввода текста недоступен (установите pyautogui)."
+            return "Модуль ввода недоступен."
         ui_action(f"Typing: {text[:60]}")
         try:
-            # pyautogui.typewrite doesn't handle non-ASCII well on Windows;
-            # pyperclip + Ctrl+V is more reliable for Cyrillic / special chars.
-            import pyperclip  # type: ignore
-            pyperclip.copy(text)
-            pyautogui.hotkey("ctrl", "v")
-        except ImportError:
-            # Fallback for plain ASCII
-            pyautogui.typewrite(text, interval=0.02)
-        time.sleep(0.1)
-        return f"Введено: {text[:50]}"
+            if PYPERCLIP_OK:
+                pyperclip.copy(text)
+                pyautogui.hotkey("ctrl", "v")
+            else:
+                try:
+                    pyautogui.typewrite(text, interval=0.02)
+                except Exception:
+                    return "Нужен pyperclip для кириллицы (pip install pyperclip)."
+            time.sleep(0.1)
+            return f"Введено: {text[:50]}"
+        except Exception as e:
+            return f"Ошибка ввода: {e}"
 
-    # ── Tool: open_url ────────────────────────────────────────────────────────
+    # ── URL / web ────────────────────────────────────────────────────────────
 
-    def open_url(self, url: str, browser: str = "firefox") -> str:
-        """
-        Navigate a browser to a URL.
-        1. Focus or launch the browser.
-        2. Ctrl+L → type URL → Enter.
-        """
-        if not GUI_OK:
-            return "Модуль управления браузером недоступен."
-
-        # Ensure URL has a scheme
+    @tool("open_url", ["url", "browser"], "open URL; browser='default'|'firefox'|'chrome'")
+    def open_url(self, url: str, browser: str = "default") -> str:
         if not url.startswith(("http://", "https://")):
             url = "https://" + url
+        browser = (browser or "default").strip().lower()
+        if browser not in ("", "default"):
+            path = self._resolve_app_path(browser)
+            if path:
+                if self._popen(path, url):
+                    return f"Открываю {url} в {browser}."
+        try:
+            os.startfile(url)
+            return f"Открываю {url}."
+        except Exception as e:
+            return f"Не удалось открыть {url}: {e}"
 
-        # Step 1: ensure browser is open and focused
-        msg = self.focus_or_launch(browser)
-        ui_action(f"Browser: {msg}")
+    @tool("play_youtube", ["query"], "search YouTube and open in browser")
+    def play_youtube(self, query: str) -> str:
+        url = "https://www.youtube.com/results?search_query=" + urllib.parse.quote(query)
+        try:
+            os.startfile(url)
+            return f"Открываю YouTube: {query}."
+        except Exception as e:
+            return f"Ошибка: {e}"
 
-        # Wait for window to appear (up to 8 s)
-        for _ in range(16):
-            if self._find_windows(browser):
-                break
-            time.sleep(0.5)
-        else:
-            return f"Браузер {browser} не открылся вовремя."
+    @tool("search_web", ["query"], "search the web via DuckDuckGo")
+    def search_web(self, query: str) -> str:
+        url = "https://duckduckgo.com/?q=" + urllib.parse.quote(query)
+        try:
+            os.startfile(url)
+            return f"Ищу: {query}."
+        except Exception as e:
+            return f"Ошибка поиска: {e}"
 
-        time.sleep(0.5)   # settle
+    # ── Files ────────────────────────────────────────────────────────────────
 
-        # Step 2: navigate
-        self.press_key("ctrl", "l")
-        time.sleep(0.3)
-        self.press_key("ctrl", "a")   # clear existing address
-        time.sleep(0.1)
-
-        # Type URL (ASCII-safe; URLs are ASCII)
-        if GUI_OK:
-            pyautogui.typewrite(url, interval=0.025)
-        time.sleep(0.15)
-        self.press_key("enter")
-
-        ui_action(f"Navigating to: {url}")
-        return f"Открываю {url} в {browser}."
-
-    # ── Tool: create_folder ───────────────────────────────────────────────────
-
+    @tool("create_folder", ["name"], "create folder on Desktop")
     def create_folder(self, name: str) -> str:
-        """Create a new folder on the Desktop."""
-        # Strip forbidden Windows path chars
         safe = re.sub(r'[<>:"/\\|?*]', "", name).strip()
         if not safe:
             return "Недопустимое имя папки."
-        path = os.path.join(DESKTOP, safe)
+        path = os.path.join(self._desktop, safe)
         if os.path.exists(path):
-            return f"Папка «{safe}» уже существует на рабочем столе."
+            return f"Папка «{safe}» уже существует."
         try:
             os.makedirs(path, exist_ok=True)
-            ui_action(f"Created folder: {path}")
-            return f"Папка «{safe}» создана на рабочем столе."
-        except PermissionError:
-            return "Нет прав для создания папки."
+            return f"Папка «{safe}» создана."
         except Exception as e:
-            return f"Ошибка создания папки: {e}"
+            return f"Ошибка: {e}"
 
-    # ── Tool: delete_folder ───────────────────────────────────────────────────
-
+    @tool("delete_folder", ["name"], "send file/folder from Desktop to Recycle Bin", destructive=True)
     def delete_folder(self, name: str) -> str:
-        """Delete a file or folder on the Desktop by sending it to the Recycle Bin."""
         safe = re.sub(r'[<>:"/\\|?*]', "", name).strip()
-        path = os.path.join(DESKTOP, safe)
+        path = os.path.join(self._desktop, safe)
         if not os.path.exists(path):
             return f"«{safe}» не найден на рабочем столе."
         try:
-            # Use Windows shell to move to Recycle Bin (safer than shutil.rmtree)
-            subprocess.run(
-                ["powershell", "-Command",
-                 f'Add-Type -AssemblyName Microsoft.VisualBasic; '
-                 f'[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory('
-                 f'"{path}", '
-                 f'"OnlyErrorDialogs", "SendToRecycleBin")'],
-                creationflags=subprocess.CREATE_NO_WINDOW,
-                check=True,
+            is_dir = os.path.isdir(path)
+            method = "DeleteDirectory" if is_dir else "DeleteFile"
+            ps = (
+                f'Add-Type -AssemblyName Microsoft.VisualBasic; '
+                f'[Microsoft.VisualBasic.FileIO.FileSystem]::{method}('
+                f'"{path}", "OnlyErrorDialogs", "SendToRecycleBin")'
             )
-            ui_action(f"Deleted (Recycle Bin): {path}")
+            subprocess.run(["powershell", "-Command", ps],
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                           capture_output=True, check=True)
             return f"«{safe}» отправлен в корзину."
         except Exception as e:
-            # Hard delete as fallback
-            try:
-                if os.path.isdir(path):
-                    shutil.rmtree(path)
-                else:
-                    os.remove(path)
-                return f"«{safe}» удалён."
-            except Exception as e2:
-                return f"Ошибка удаления: {e2}"
+            return f"Не удалось отправить в корзину: {e}. Отмена."
 
-    # ── Tool: rename_item ─────────────────────────────────────────────────────
-
+    @tool("rename_item", ["old_name", "new_name"], "rename file/folder on Desktop")
     def rename_item(self, old_name: str, new_name: str) -> str:
-        """Rename a file or folder on the Desktop."""
-        old_path = os.path.join(DESKTOP, old_name.strip())
-        new_path = os.path.join(DESKTOP, new_name.strip())
+        old_path = os.path.join(self._desktop, old_name.strip())
+        new_path = os.path.join(self._desktop, new_name.strip())
         if not os.path.exists(old_path):
-            return f"«{old_name}» не найден на рабочем столе."
+            return f"«{old_name}» не найден."
         if os.path.exists(new_path):
             return f"«{new_name}» уже существует."
         try:
             os.rename(old_path, new_path)
-            ui_action(f"Renamed: {old_name} → {new_name}")
-            return f"«{old_name}» переименован в «{new_name}»."
-        except PermissionError:
-            return "Нет прав для переименования."
+            return f"«{old_name}» → «{new_name}»."
         except Exception as e:
-            return f"Ошибка переименования: {e}"
+            return f"Ошибка: {e}"
 
-    # ── Tool: media controls ──────────────────────────────────────────────────
+    @tool("open_path", ["path"], "open a folder or file by absolute path")
+    def open_path(self, path: str) -> str:
+        if not os.path.exists(path):
+            return f"Путь не найден: {path}"
+        try:
+            os.startfile(path)
+            return f"Открываю: {path}"
+        except Exception as e:
+            return f"Ошибка: {e}"
 
+    @tool("write_note", ["name", "text"], "write a .txt note to Desktop")
+    def write_note(self, name: str, text: str) -> str:
+        safe = re.sub(r'[<>:"/\\|?*]', "", name).strip() or "note"
+        if not safe.endswith(".txt"):
+            safe += ".txt"
+        path = os.path.join(self._desktop, safe)
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+            return f"Заметка «{safe}» сохранена."
+        except Exception as e:
+            return f"Ошибка: {e}"
+
+    @tool("screenshot", [], "save a screenshot to Desktop")
+    def screenshot(self) -> str:
+        if not GUI_OK:
+            return "Скриншот недоступен."
+        try:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = os.path.join(self._desktop, f"shot_{ts}.png")
+            pyautogui.screenshot(path)
+            return f"Скриншот: {os.path.basename(path)}"
+        except Exception as e:
+            return f"Ошибка: {e}"
+
+    # ── Media (Win32 VK) ─────────────────────────────────────────────────────
+
+    @tool("media_play_pause", [], "toggle media playback")
     def media_play_pause(self) -> str:
-        self.press_key("playpause")
+        _press_vk(_VK["playpause"])
         return "Воспроизведение / пауза."
 
+    @tool("media_next", [], "next media track")
     def media_next(self) -> str:
-        self.press_key("nexttrack")
+        _press_vk(_VK["nexttrack"])
         return "Следующий трек."
 
+    @tool("media_prev", [], "previous media track")
     def media_prev(self) -> str:
-        self.press_key("prevtrack")
+        _press_vk(_VK["prevtrack"])
         return "Предыдущий трек."
 
-    def media_volume_up(self) -> str:
-        self.press_key("volumeup")
-        return "Громкость увеличена."
+    @tool("volume_up", ["steps"], "increase volume (2% per step, default 5)")
+    def volume_up(self, steps: int = 5) -> str:
+        try:
+            n = max(1, int(steps))
+        except (TypeError, ValueError):
+            n = 5
+        for _ in range(n):
+            _press_vk(_VK["volumeup"])
+        return f"Громкость +{n*2}%."
 
-    def media_volume_down(self) -> str:
-        self.press_key("volumedown")
-        return "Громкость уменьшена."
+    @tool("volume_down", ["steps"], "decrease volume (2% per step, default 5)")
+    def volume_down(self, steps: int = 5) -> str:
+        try:
+            n = max(1, int(steps))
+        except (TypeError, ValueError):
+            n = 5
+        for _ in range(n):
+            _press_vk(_VK["volumedown"])
+        return f"Громкость −{n*2}%."
 
-    # ── Tool: time / date ─────────────────────────────────────────────────────
+    @tool("mute_toggle", [], "toggle mute")
+    def mute_toggle(self) -> str:
+        _press_vk(_VK["volumemute"])
+        return "Звук переключён."
 
+    # ── Clipboard ────────────────────────────────────────────────────────────
+
+    @tool("clipboard_get", [], "read current clipboard")
+    def clipboard_get(self) -> str:
+        if not PYPERCLIP_OK:
+            return "Нужен pyperclip."
+        val = pyperclip.paste() or ""
+        return f"В буфере: {val[:200]}" if val else "Буфер пуст."
+
+    @tool("clipboard_set", ["text"], "write text to clipboard")
+    def clipboard_set(self, text: str) -> str:
+        if not PYPERCLIP_OK:
+            return "Нужен pyperclip."
+        pyperclip.copy(text)
+        return "Скопировано в буфер."
+
+    # ── Windows / system ─────────────────────────────────────────────────────
+
+    @tool("lock_pc", [], "lock the workstation", destructive=True)
+    def lock_pc(self) -> str:
+        try:
+            ctypes.windll.user32.LockWorkStation()
+            return "Блокирую компьютер."
+        except Exception as e:
+            return f"Ошибка: {e}"
+
+    @tool("system_stats", [], "report CPU/RAM/battery usage")
+    def system_stats(self) -> str:
+        if not PSUTIL_OK:
+            return "Статистика недоступна (pip install psutil)."
+        try:
+            cpu = psutil.cpu_percent(interval=0.4)
+            mem = psutil.virtual_memory().percent
+            parts = [f"ЦП {cpu:.0f}%", f"ОЗУ {mem:.0f}%"]
+            try:
+                bat = psutil.sensors_battery()
+                if bat:
+                    parts.append(f"Батарея {bat.percent:.0f}%")
+            except Exception:
+                pass
+            return ", ".join(parts) + "."
+        except Exception as e:
+            return f"Ошибка: {e}"
+
+    @tool("list_windows", [], "list titles of currently open windows")
+    def list_windows(self) -> str:
+        if not GUI_OK:
+            return "Недоступно."
+        try:
+            titles = [w.title.strip() for w in gw.getAllWindows() if w.title.strip()]
+        except Exception:
+            return "Ошибка."
+        if not titles:
+            return "Окон не найдено."
+        shown = titles[:10]
+        suffix = "…" if len(titles) > 10 else "."
+        return "Открыты: " + "; ".join(shown) + suffix
+
+    # ── Time / reminders ─────────────────────────────────────────────────────
+
+    @tool("get_time", [], "get current time as string")
     def get_time(self) -> str:
         n = datetime.now()
         return f"Сейчас {n.hour} часов {n.minute} минут."
 
+    @tool("get_date", [], "get current date as string")
     def get_date(self) -> str:
-        days = ["понедельник","вторник","среда","четверг",
-                "пятница","суббота","воскресенье"]
-        months = ["января","февраля","марта","апреля","мая","июня",
-                  "июля","августа","сентября","октября","ноября","декабря"]
+        days = ["понедельник", "вторник", "среда", "четверг",
+                "пятница", "суббота", "воскресенье"]
+        months = ["января", "февраля", "марта", "апреля", "мая", "июня",
+                  "июля", "августа", "сентября", "октября", "ноября", "декабря"]
         n = datetime.now()
         return (f"Сегодня {days[n.weekday()]}, "
                 f"{n.day} {months[n.month-1]} {n.year} года.")
 
+    @tool("set_timer", ["seconds", "label"], "set a reminder after N seconds")
+    def set_timer(self, seconds, label: str = "") -> str:
+        try:
+            secs = int(float(seconds))
+        except (TypeError, ValueError):
+            return "Неверная длительность."
+        if secs <= 0:
+            return "Длительность должна быть положительной."
+        msg = f"Сэр, напоминание: {label}." if label else "Сэр, время вышло."
+        t = threading.Timer(secs, lambda: self._tts.speak(msg))
+        t.daemon = True
+        t.start()
+        return f"Таймер на {secs} секунд установлен."
+
+    # ── Weather ──────────────────────────────────────────────────────────────
+
+    @tool("get_weather", ["city"], "get current weather for a city")
+    def get_weather(self, city: str = "") -> str:
+        try:
+            q = urllib.parse.quote(city.strip()) if city else ""
+            url = f"https://wttr.in/{q}?format=j1&lang=ru"
+            with urllib.request.urlopen(url, timeout=6) as r:
+                data = json.loads(r.read().decode("utf-8", "replace"))
+            cur = data["current_condition"][0]
+            temp = cur["temp_C"]
+            desc = ""
+            if "lang_ru" in cur and cur["lang_ru"]:
+                desc = cur["lang_ru"][0]["value"]
+            elif cur.get("weatherDesc"):
+                desc = cur["weatherDesc"][0]["value"]
+            where = f" в {city}" if city else ""
+            return f"Погода{where}: {desc}, {temp}°C."
+        except Exception as e:
+            return f"Не удалось получить погоду: {e}"
+
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  §5  ACTION DISPATCHER
+#  §7  ACTION DISPATCHER
 # ══════════════════════════════════════════════════════════════════════════════
 
 class ActionDispatcher:
-    """
-    Executes a list of action dicts produced by the LLM planner.
-
-    Each action dict has the shape:
-        { "tool": "<tool_name>", "args": { "<param>": "<value>", … } }
-
-    The dispatcher maps tool names → ToolBox methods via a static registry.
-    Unknown tool names produce a warning and are skipped — no eval, no exec.
-    """
-
     def __init__(self, toolbox: ToolBox):
         self._tb = toolbox
-        # ── Closed tool registry ──────────────────────────────────────────────
-        # Maps JSON tool name → (method, positional_arg_keys)
-        # positional_arg_keys defines the order args are passed to the method.
-        self._registry: dict[str, tuple] = {
-            "launch_app":        (self._tb.launch_app,       ["name"]),
-            "focus_or_launch":   (self._tb.focus_or_launch,  ["name"]),
-            "focus_window":      (self._tb.focus_window,     ["title"]),
-            "close_app":         (self._tb.close_app,        ["name"]),
-            "press_key":         (self._tb.press_key,        ["keys"]),   # keys = list or str
-            "type_text":         (self._tb.type_text,        ["text"]),
-            "open_url":          (self._tb.open_url,         ["url", "browser"]),
-            "create_folder":     (self._tb.create_folder,    ["name"]),
-            "delete_folder":     (self._tb.delete_folder,    ["name"]),
-            "rename_item":       (self._tb.rename_item,      ["old_name", "new_name"]),
-            "media_play_pause":  (self._tb.media_play_pause, []),
-            "media_next":        (self._tb.media_next,       []),
-            "media_prev":        (self._tb.media_prev,       []),
-            "media_volume_up":   (self._tb.media_volume_up,  []),
-            "media_volume_down": (self._tb.media_volume_down,[]),
-            "get_time":          (self._tb.get_time,         []),
-            "get_date":          (self._tb.get_date,         []),
-        }
 
     def run(self, actions: list[dict]) -> list[str]:
-        """
-        Execute a sequence of action dicts.
-        Returns a list of result strings from each tool call.
-        """
         results: list[str] = []
         for action in actions:
-            tool_name = action.get("tool", "").strip()
-            args_dict  = action.get("args", {})
+            name = (action.get("tool") or "").strip()
+            args = action.get("args") or {}
 
-            if tool_name not in self._registry:
-                ui_warn(f"Unknown tool skipped: '{tool_name}'")
+            if name not in ToolBox._TOOLS:
+                ui_warn(f"Unknown tool skipped: '{name}'")
                 continue
 
-            method, arg_keys = self._registry[tool_name]
-            ui_action(f"Tool: {tool_name}  args: {args_dict}")
+            meta = ToolBox._TOOLS[name]
+            method = getattr(self._tb, name, None)
+            if method is None:
+                ui_warn(f"Tool '{name}' registered but no method found.")
+                continue
+
+            ui_action(f"Tool: {name}  args: {args}")
 
             try:
-                # Build positional args in declared order; missing keys → skip
                 pos_args: list[Any] = []
-                for key in arg_keys:
-                    if key not in args_dict:
-                        break
-                    val = args_dict[key]
-                    # Special case: press_key accepts a list of keys
-                    if key == "keys" and isinstance(val, list):
-                        pos_args.extend(val)
+                for key in meta["args"]:
+                    if key not in args:
+                        break  # let Python defaults handle the rest
+                    val = args[key]
+                    if key == "keys":
+                        pos_args.extend(ToolBox._normalize_keys(val))
                     else:
                         pos_args.append(val)
-
                 result = method(*pos_args)
                 if result:
                     results.append(str(result))
-
             except Exception as e:
-                msg = f"Ошибка выполнения {tool_name}: {e}"
+                msg = f"Ошибка {name}: {e}"
                 ui_error(msg)
-                log.exception("ActionDispatcher error in tool '%s'", tool_name)
+                log.exception("Dispatcher error in '%s'", name)
                 results.append(msg)
 
-            # Brief pause between sequential actions so the OS can settle
             time.sleep(0.15)
 
         return results
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  §6  LLM PLANNER
+#  §8  SYSTEM PROMPT  (built dynamically from the tool registry)
 # ══════════════════════════════════════════════════════════════════════════════
 
-# ── System prompt ──────────────────────────────────────────────────────────────
-# The prompt is written entirely in English so the model reliably follows the
-# JSON schema, while speech output remains Russian.
+def build_system_prompt() -> str:
+    rows = ["| tool | args | description |", "|---|---|---|"]
+    for name, meta in ToolBox._TOOLS.items():
+        args = ", ".join(meta["args"]) if meta["args"] else "—"
+        rows.append(f"| {name} | {args} | {meta['desc']} |")
+    tools_table = "\n".join(rows)
 
-SYSTEM_PROMPT = f"""You are JARVIS Mark-2, a personal AI assistant running on Windows.
-You speak ONLY in Russian, but you must think in English when planning actions.
+    app_names = ", ".join(f'"{n}"' for n in CFG["paths"]["apps"].keys())
+
+    return f"""You are JARVIS Mark-3, a personal AI assistant on Windows.
+You speak ONLY in Russian, but you think in English when planning.
 
 ## IDENTITY
 - Witty, elegant, slightly sarcastic — like JARVIS from Iron Man.
-- Address the user as "сэр" (sir).
-- Keep speech responses to 2–3 sentences maximum.
-- Never identify yourself as an AI model, GPT, or Claude. You are JARVIS.
+- Address the user as "сэр".
+- Speech responses: 1–3 sentences. No filler.
+- Never say you are an AI, GPT, or Claude. You are JARVIS.
 
 ## OUTPUT FORMAT  ← CRITICAL
-You MUST respond with a valid JSON object. Nothing else. No markdown fences.
+Respond with a valid JSON object and nothing else. No markdown fences.
 Schema:
 {{
-  "speech": "<Russian text to speak aloud>",
-  "actions": [
-    {{ "tool": "<tool_name>", "args": {{ "<param>": "<value>" }} }},
-    ...
-  ]
+  "speech": "<Russian text to speak>",
+  "actions": [ {{ "tool": "<name>", "args": {{ "<param>": "<value>" }} }} ]
 }}
+If no action is needed (pure conversation), return "actions": [].
 
-If no action is needed (e.g. a pure conversation question), return "actions": [].
+## TOOLS
+{tools_table}
 
-## AVAILABLE TOOLS
-| tool              | args                              | description                          |
-|-------------------|-----------------------------------|--------------------------------------|
-| launch_app        | name (str)                        | launch an app by name                |
-| focus_or_launch   | name (str)                        | focus window if open, else launch    |
-| focus_window      | title (str)                       | bring existing window to front       |
-| close_app         | name (str)                        | kill process (taskkill)              |
-| press_key         | keys (list of str)                | press hotkey, e.g. ["ctrl","l"]      |
-| type_text         | text (str)                        | type text into active window         |
-| open_url          | url (str), browser (str)          | navigate browser to URL              |
-| create_folder     | name (str)                        | create folder on Desktop             |
-| delete_folder     | name (str)                        | delete item from Desktop             |
-| rename_item       | old_name (str), new_name (str)    | rename file/folder on Desktop        |
-| media_play_pause  | —                                 | toggle play/pause                    |
-| media_next        | —                                 | next track                           |
-| media_prev        | —                                 | previous track                       |
-| media_volume_up   | —                                 | volume up                            |
-| media_volume_down | —                                 | volume down                          |
-| get_time          | —                                 | get current time (returns string)    |
-| get_date          | —                                 | get current date (returns string)    |
+## APP NAMES (exact strings for launch_app / focus_or_launch / close_app)
+{app_names}
 
-## APP NAME REGISTRY (use these exact names in tool args)
-- "yandex music"  → {APP_PATHS.get('yandex music', 'YandexMusicMod')}
-- "steam"         → Steam
-- "telegram"      → Telegram
-- "firefox"       → Firefox
-- "chrome"        → Chrome
-- "vs code"       → VS Code
-- "discord"       → Discord
-- "spotify"       → Spotify
-- "notepad"       → Notepad
-- "explorer"      → File Explorer
+## RULES
+- "launch_app" for a fresh start; "focus_or_launch" if the user likely already has it open.
+- "close_app" takes the bare name (e.g. "firefox").
+- "open_url" browser arg: "default", "firefox", or "chrome".
+- "get_time" / "get_date" return a string — the tool result will be spoken, so
+  DO NOT duplicate the value in "speech"; just say "Сейчас, сэр." and let the tool speak.
+- "get_weather" city is optional; empty string = auto-detect.
+- For destructive actions (delete_folder, close_app, lock_pc) — the system
+  will ask the user for confirmation, so do not add extra warnings in speech.
+- "press_key": pass a list like ["ctrl","l"] OR a string "ctrl+l".
+- "set_timer": seconds as integer, label as optional string.
+- Never invent tools not in the table.
+- Never include code, markdown, or commentary outside the JSON.
 
 ## EXAMPLES
 
 User: "Открой YouTube в Firefox"
-Response:
-{{"speech": "Открываю YouTube в Firefox, сэр.", "actions": [{{"tool": "open_url", "args": {{"url": "youtube.com", "browser": "firefox"}}}}]}}
+{{"speech":"Открываю YouTube, сэр.","actions":[{{"tool":"open_url","args":{{"url":"youtube.com","browser":"firefox"}}}}]}}
 
 User: "Открой стим"
-Response:
-{{"speech": "Запускаю Steam, сэр.", "actions": [{{"tool": "focus_or_launch", "args": {{"name": "steam"}}}}]}}
+{{"speech":"Запускаю Steam, сэр.","actions":[{{"tool":"focus_or_launch","args":{{"name":"steam"}}}}]}}
 
 User: "Закрой firefox"
-Response:
-{{"speech": "Закрываю Firefox, сэр.", "actions": [{{"tool": "close_app", "args": {{"name": "firefox"}}}}]}}
+{{"speech":"Закрываю Firefox, сэр.","actions":[{{"tool":"close_app","args":{{"name":"firefox"}}}}]}}
 
 User: "Создай папку Проекты"
-Response:
-{{"speech": "Создаю папку Проекты на рабочем столе, сэр.", "actions": [{{"tool": "create_folder", "args": {{"name": "Проекты"}}}}]}}
-
-User: "Переименуй Проекты в Архив"
-Response:
-{{"speech": "Переименовываю папку, сэр.", "actions": [{{"tool": "rename_item", "args": {{"old_name": "Проекты", "new_name": "Архив"}}}}]}}
-
-User: "Включи музыку"
-Response:
-{{"speech": "Включаю Яндекс Музыку, сэр.", "actions": [{{"tool": "focus_or_launch", "args": {{"name": "yandex music"}}}}, {{"tool": "media_play_pause", "args": {{}}}}]}}
-
-User: "Следующий трек"
-Response:
-{{"speech": "Переключаю трек, сэр.", "actions": [{{"tool": "media_next", "args": {{}}}}]}}
+{{"speech":"Создаю папку Проекты, сэр.","actions":[{{"tool":"create_folder","args":{{"name":"Проекты"}}}}]}}
 
 User: "Который час?"
-Response:
-{{"speech": "Сейчас {{time}}, сэр.", "actions": [{{"tool": "get_time", "args": {{}}}}]}}
+{{"speech":"Сейчас, сэр.","actions":[{{"tool":"get_time","args":{{}}}}]}}
+
+User: "Погода в Москве"
+{{"speech":"Сейчас узнаю, сэр.","actions":[{{"tool":"get_weather","args":{{"city":"Москва"}}}}]}}
+
+User: "Поставь таймер на 10 минут на чай"
+{{"speech":"Таймер на десять минут установлен, сэр.","actions":[{{"tool":"set_timer","args":{{"seconds":600,"label":"чай"}}}}]}}
+
+User: "Следующий трек"
+{{"speech":"Переключаю, сэр.","actions":[{{"tool":"media_next","args":{{}}}}]}}
+
+User: "Найди в интернете рецепт борща"
+{{"speech":"Ищу, сэр.","actions":[{{"tool":"search_web","args":{{"query":"рецепт борща"}}}}]}}
+
+User: "Сделай скриншот"
+{{"speech":"Секунду, сэр.","actions":[{{"tool":"screenshot","args":{{}}}}]}}
 
 User: "Что такое квантовый компьютер?"
-Response:
-{{"speech": "Квантовый компьютер использует кубиты вместо битов, сэр. Это позволяет решать определённые задачи экспоненциально быстрее классических машин.", "actions": []}}
+{{"speech":"Квантовый компьютер использует кубиты вместо битов, сэр. Это позволяет решать определённые задачи экспоненциально быстрее классических машин.","actions":[]}}
 """
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  §9  LLM PLANNER
+# ══════════════════════════════════════════════════════════════════════════════
+
 class LLMPlanner:
-    """
-    Sends the user's request to Ollama and parses the JSON action plan.
-
-    The response is expected to be a JSON object with two keys:
-      "speech"  : str  — what JARVIS says aloud
-      "actions" : list — list of tool-call dicts
-    """
-
     def __init__(self):
         self._client = OpenAI(
-            base_url=OLLAMA_BASE_URL,
-            api_key="ollama",           # Ollama ignores the key value
+            base_url=CFG["ollama"]["base_url"],
+            api_key="ollama",
         )
+        self._system = build_system_prompt()
         self._history: list[dict] = []
-
-    # ── JSON extraction ───────────────────────────────────────────────────────
+        self._max_history = CFG["ollama"]["max_history"]
 
     @staticmethod
     def _extract_json(raw: str) -> Optional[dict]:
-        """
-        Try to extract a valid JSON object from the raw model output.
-        The model sometimes wraps JSON in markdown fences or adds preamble text.
-        """
-        # Remove markdown code fences if present
-        text = re.sub(r"```(?:json)?", "", raw, flags=re.IGNORECASE).strip()
+        text = re.sub(r"```(?:json)?", "", raw, flags=re.IGNORECASE).replace("```", "").strip()
 
-        # Try parsing the whole string first
+        # 1) whole-string parse
         try:
-            return json.loads(text)
+            val = json.loads(text)
+            if isinstance(val, dict):
+                return val
         except json.JSONDecodeError:
             pass
 
-        # Find the first { … } block that looks like our schema
-        match = re.search(r'\{.*\}', text, re.DOTALL)
-        if match:
+        # 2) non-greedy brace match
+        m = re.search(r"\{.*?\}", text, re.DOTALL)
+        if m:
             try:
-                return json.loads(match.group(0))
+                val = json.loads(m.group(0))
+                if isinstance(val, dict):
+                    return val
             except json.JSONDecodeError:
                 pass
 
+        # 3) raw_decode fallback
+        try:
+            idx = text.find("{")
+            if idx >= 0:
+                obj, _ = json.JSONDecoder().raw_decode(text[idx:])
+                if isinstance(obj, dict):
+                    return obj
+        except Exception:
+            pass
+
         return None
 
-    # ── Plan ──────────────────────────────────────────────────────────────────
+    def _call_model(self, messages: list[dict]) -> str:
+        resp = self._client.chat.completions.create(
+            model=CFG["ollama"]["model"],
+            messages=messages,
+            temperature=0.3,
+            timeout=CFG["ollama"]["timeout"],
+        )
+        return (resp.choices[0].message.content or "").strip()
 
     def plan(self, user_text: str) -> dict:
-        """
-        Ask the LLM to plan a response to user_text.
-
-        Returns a dict:
-            { "speech": str, "actions": list[dict] }
-        Always returns a valid dict — never raises.
-        """
         self._history.append({"role": "user", "content": user_text})
+        if len(self._history) > self._max_history * 2:
+            self._history = self._history[-(self._max_history * 2):]
 
-        # Rolling window
-        if len(self._history) > MAX_HISTORY * 2:
-            self._history = self._history[-(MAX_HISTORY * 2):]
-
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}] + self._history
+        messages = [{"role": "system", "content": self._system}] + self._history
 
         try:
-            ui_plan(None)
-            response = self._client.chat.completions.create(
-                model=OLLAMA_MODEL,
-                messages=messages,
-                temperature=0.3,        # lower temp = more consistent JSON output
-                timeout=LLM_TIMEOUT,
-            )
-            raw = response.choices[0].message.content.strip()
-            ui_info(f"Raw LLM output ({len(raw)} chars): {raw[:200]}")
+            ui_plan()
+            raw = self._call_model(messages)
+            ui_info(f"Raw LLM ({len(raw)} chars): {raw[:200]}")
 
             plan = self._extract_json(raw)
 
+            # One retry if the model failed to produce JSON
             if plan is None:
-                # Model didn't return JSON — treat whole response as speech
-                ui_warn("LLM returned non-JSON; treating as speech.")
-                plan = {"speech": raw, "actions": []}
+                ui_warn("Non-JSON response — retrying once.")
+                retry_messages = messages + [
+                    {"role": "assistant", "content": raw},
+                    {"role": "user", "content":
+                     "Your reply was not valid JSON. Reply ONLY with the JSON object "
+                     "described in the system prompt. No prose, no fences."},
+                ]
+                raw2 = self._call_model(retry_messages)
+                plan = self._extract_json(raw2)
+                if plan is None:
+                    ui_warn("Retry also failed — using text as speech.")
+                    plan = {"speech": raw, "actions": []}
 
-            # Validate schema
-            if "speech" not in plan:
+            if not isinstance(plan.get("speech"), str):
                 plan["speech"] = "Команда получена, сэр."
-            if "actions" not in plan or not isinstance(plan["actions"], list):
+            if not isinstance(plan.get("actions"), list):
                 plan["actions"] = []
 
-            self._history.append({"role": "assistant",
-                                   "content": json.dumps(plan, ensure_ascii=False)})
+            # Store a compact assistant turn
+            used_tools = [a.get("tool", "?") for a in plan["actions"] if isinstance(a, dict)]
+            summary = plan["speech"]
+            if used_tools:
+                summary += f"  [used: {', '.join(used_tools)}]"
+            self._history.append({"role": "assistant", "content": summary})
+
             ui_json(plan)
             return plan
 
         except Exception as e:
-            log.error("LLMPlanner.plan() error: %s", e, exc_info=True)
-            err_str = str(e)
-            if "connection" in err_str.lower() or "refused" in err_str.lower():
-                speech = ("Сэр, нет соединения с Ollama. "
-                          "Убедитесь, что служба запущена командой ollama serve.")
-            elif "timeout" in err_str.lower():
-                speech = "Сэр, модель не ответила вовремя. Попробуйте ещё раз."
+            log.error("LLMPlanner.plan error: %s", e, exc_info=True)
+            err = str(e).lower()
+            if "connection" in err or "refused" in err:
+                speech = "Сэр, нет соединения с Ollama. Убедитесь, что служба запущена (ollama serve)."
+            elif "timeout" in err:
+                speech = "Сэр, модель не ответила вовремя."
             else:
-                speech = f"Сэр, ошибка языкового модуля: {err_str[:80]}"
-
+                speech = f"Сэр, ошибка языкового модуля: {str(e)[:80]}"
             return {"speech": speech, "actions": []}
 
-    def reset(self):
+    def reset(self) -> None:
         self._history.clear()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  §7  AGENT CORE
+#  §10  AGENT CORE
 # ══════════════════════════════════════════════════════════════════════════════
 
+_SHUTDOWN_PHRASES = (
+    "выключись", "отбой", "до свидания", "выход",
+    "пока джарвис", "стоп джарвис", "завершение работы",
+)
+_CANCEL_PHRASES = ("стоп", "отмена", "отставить", "хватит")
+
+
+def _is_shutdown(text: str) -> bool:
+    tl = " " + text.lower().strip(" .,!?") + " "
+    for kw in _SHUTDOWN_PHRASES:
+        if f" {kw} " in tl:
+            return True
+    return False
+
+
+def _is_cancel(text: str) -> bool:
+    tl = text.lower().strip(" .,!?")
+    return tl in _CANCEL_PHRASES
+
+
 class AgentCore:
-    """
-    Ties together STT → LLMPlanner → ActionDispatcher → TTS.
-
-    handle(text) is the single entry point for a recognised voice command.
-    It always calls tts.speak() at the end — the speech bug is impossible here
-    because speak() is in the final statement before return.
-    """
-
-    # Hard-coded stop keywords to avoid LLM roundtrip for shutdown
-    _STOP_KW = frozenset([
-        "стоп", "выключись", "пока", "до свидания", "выход",
-        "выключи джарвис", "стоп джарвис",
-    ])
-
-    def __init__(self, tts: TTSEngine, planner: LLMPlanner,
-                 dispatcher: ActionDispatcher):
+    def __init__(self, tts: TTSEngine, stt: STTEngine,
+                 planner: LLMPlanner, dispatcher: ActionDispatcher):
         self._tts        = tts
+        self._stt        = stt
         self._planner    = planner
         self._dispatcher = dispatcher
+        self._confirm    = CFG.get("confirm_destructive", True)
+
+    # ── Destructive confirmation ──────────────────────────────────────────────
+
+    @staticmethod
+    def _destructive_actions(actions: list[dict]) -> list[dict]:
+        return [a for a in actions
+                if isinstance(a, dict)
+                and ToolBox._TOOLS.get(a.get("tool"), {}).get("destructive")]
+
+    def _confirm_destructive(self, actions: list[dict]) -> bool:
+        names = ", ".join(sorted({a.get("tool", "?") for a in actions}))
+        self._tts.speak_sync(
+            f"Сэр, требуется подтверждение для: {names}. Скажите «да» или «нет»."
+        )
+        answer = self._stt.listen_once()
+        if not answer:
+            return False
+        al = answer.lower()
+        return any(w in al for w in ("да", "yes", "подтверждаю", "конечно", "ок"))
+
+    # ── Handle one command ────────────────────────────────────────────────────
 
     def handle(self, text: str) -> bool:
-        """
-        Process one recognised command.
-        Returns False → main loop should stop (shutdown command).
-        Returns True  → keep listening.
-        """
         lower = text.lower().strip()
 
-        # ── Hard-coded shutdown (no LLM call) ─────────────────────────────────
-        if any(kw in lower for kw in self._STOP_KW):
-            self._tts.speak_sync(
-                "Сэр, все системы переходят в режим ожидания. "
-                "До следующего раза."
-            )
-            return False    # ← only place that returns False
+        if _is_shutdown(lower):
+            self._tts.speak_sync("Сэр, перехожу в режим ожидания. До связи.")
+            return False
+
+        if _is_cancel(lower):
+            self._tts.speak("Отменяю, сэр.")
+            return True
 
         ui_sep()
 
-        # ── LLM planning phase ────────────────────────────────────────────────
-        plan = self._planner.plan(text)
+        # Filler for slow planning
+        filler = threading.Timer(1.5, lambda: self._tts.speak("Секунду, сэр…"))
+        filler.daemon = True
+        filler.start()
+        try:
+            plan = self._planner.plan(text)
+        finally:
+            filler.cancel()
 
-        speech  = plan.get("speech", "").strip()
-        actions = plan.get("actions", [])
+        speech  = (plan.get("speech") or "").strip()
+        actions = plan.get("actions") or []
 
-        # ── Action execution phase ────────────────────────────────────────────
-        action_results: list[str] = []
-        if actions:
-            action_results = self._dispatcher.run(actions)
+        if actions and self._confirm:
+            destructive = self._destructive_actions(actions)
+            if destructive and not self._confirm_destructive(destructive):
+                self._tts.speak("Отменено, сэр.")
+                return True
 
-        # ── Speech phase — ALWAYS executed ───────────────────────────────────
-        # If an action produced a richer result string, append it to speech.
-        # This ensures time/date tool results are spoken correctly.
-        extra = "  ".join(r for r in action_results if r and r not in speech)
-        final_speech = (speech + "  " + extra).strip() if extra else speech
+        results = self._dispatcher.run(actions) if actions else []
 
-        if not final_speech:
-            final_speech = "Выполнено, сэр."
+        # Merge tool result strings into speech (unless already contained)
+        extra = "  ".join(r for r in results if r and r not in speech)
+        final = (speech + ("  " + extra if extra else "")).strip() or "Выполнено, сэр."
 
-        self._tts.speak(final_speech)   # ← non-blocking, always called
-        return True                     # ← always True (except shutdown above)
+        self._tts.speak(final)
+        return True
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  §8  WAKE WORD FILTER
+#  §11  HOTKEY LISTENER
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _to_pynput_combo(s: str) -> str:
+    parts = re.split(r"[+\s]+", s.lower().strip())
+    mapping = {"ctrl": "<ctrl>", "alt": "<alt>", "shift": "<shift>", "win": "<cmd>"}
+    return "+".join(mapping.get(p, p) for p in parts)
+
+
+class HotkeyListener:
+    """Press hotkey → bypass wake word for the next N seconds."""
+
+    def __init__(self, on_trigger):
+        self._listener = None
+        if not PYNPUT_OK:
+            ui_warn("pynput not installed — global hotkey disabled.")
+            return
+        combo = _to_pynput_combo(CFG.get("hotkey", "ctrl+alt+j"))
+        try:
+            self._listener = pynput_kb.GlobalHotKeys({combo: on_trigger})
+            self._listener.daemon = True
+            self._listener.start()
+            ui_info(f"Hotkey armed: {CFG.get('hotkey', 'ctrl+alt+j')} (bypass wake word)")
+        except Exception as e:
+            ui_warn(f"Hotkey init failed: {e}")
+
+    def stop(self) -> None:
+        try:
+            if self._listener:
+                self._listener.stop()
+        except Exception:
+            pass
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  §12  WAKE WORD
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _has_wake_word(text: str) -> bool:
-    lower = text.lower()
-    return any(ww in lower for ww in WAKE_WORDS)
+    tl = text.lower()
+    return any(ww in tl for ww in CFG["wake_words"])
 
 
 def _strip_wake_word(text: str) -> str:
-    lower = text.lower()
-    for ww in WAKE_WORDS:
-        pattern = rf"^{re.escape(ww)}[\s,\.!?]*"
-        stripped = re.sub(pattern, "", lower, flags=re.IGNORECASE).strip()
-        if stripped != lower.strip():
-            # Find offset in original text
-            idx = text.lower().find(ww)
-            tail = text[idx + len(ww):].lstrip(" ,.")
-            return tail if tail else stripped
+    tl = text.lower()
+    for ww in CFG["wake_words"]:
+        m = re.match(rf"\s*{re.escape(ww)}\b[\s,\.!?]*", tl)
+        if m:
+            return text[m.end():].strip()
     return text.strip()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  §9  JARVIS MARK-2  MAIN CLASS
+#  §13  MAIN ORCHESTRATOR
 # ══════════════════════════════════════════════════════════════════════════════
 
-class JARVISMark2:
-    """
-    Top-level orchestrator.
-
-    Lifecycle:
-      __init__  → build all components
-      run()     → greet → listen loop → shutdown
-    """
-
-    def __init__(self):
+class JARVISMark3:
+    def __init__(self, text_mode: bool = False, no_tts: bool = False):
         ui_banner()
 
-        ui_info("Initialising TTS engine…")
-        self._tts = TTSEngine()
+        if GUI_OK and CFG.get("failsafe", True):
+            pyautogui.FAILSAFE = True
 
-        ui_info("Initialising STT engine…")
-        self._stt = STTEngine()
+        ui_info("TTS engine…")
+        self._tts = TTSEngine(enabled=not no_tts)
 
-        ui_info("Initialising ToolBox…")
-        self._toolbox = ToolBox()
+        ui_info("STT engine…")
+        self._stt = STTEngine(text_mode=text_mode)
 
-        ui_info("Initialising ActionDispatcher…")
+        ui_info("ToolBox…")
+        self._toolbox = ToolBox(self._tts)
+
+        ui_info("Dispatcher…")
         self._dispatcher = ActionDispatcher(self._toolbox)
 
-        ui_info("Initialising LLM planner…")
+        ui_info("LLM planner…")
         self._planner = LLMPlanner()
 
-        ui_info("Initialising AgentCore…")
-        self._agent = AgentCore(self._tts, self._planner, self._dispatcher)
+        ui_info("Agent core…")
+        self._agent = AgentCore(self._tts, self._stt, self._planner, self._dispatcher)
+
+        self._bypass_until = 0.0
+        self._hotkey: Optional[HotkeyListener] = None
+        if not text_mode:
+            self._hotkey = HotkeyListener(self._on_hotkey)
 
         self._running = False
 
-    # ── Signal handling ───────────────────────────────────────────────────────
+    def _on_hotkey(self) -> None:
+        self._bypass_until = time.time() + float(CFG.get("hotkey_bypass_secs", 8.0))
+        beep(1000, 120)
+        ui_info("Hotkey → bypass wake word")
 
     def _on_signal(self, sig, frame):
         print()
-        ui_warn(f"Signal {sig} received — shutting down…")
+        ui_warn(f"Signal {sig} — shutting down…")
         self._running = False
 
-    # ── Greeting ──────────────────────────────────────────────────────────────
-
-    def _greet(self):
+    def _greet(self) -> None:
         h = datetime.now().hour
         greeting = (
-            "Доброе утро" if 5  <= h < 12 else
+            "Доброе утро" if 5 <= h < 12 else
             "Добрый день" if 12 <= h < 17 else
             "Добрый вечер" if 17 <= h < 22 else
             "Доброй ночи"
         )
-        ww = " или ".join(f'«{w}»' for w in WAKE_WORDS[:2])
+        ww = " или ".join(f"«{w}»" for w in CFG["wake_words"][:2])
         ui_info(f"Wake words: {ww}")
         self._tts.speak_sync(
-            f"{greeting}, сэр. JARVIS Mark-2 в сети. "
-            f"Агентная система активирована. Ожидаю ваших команд."
+            f"{greeting}, сэр. JARVIS Mark-3 в сети. Ожидаю команд."
         )
 
-    # ── Single listen-respond cycle ───────────────────────────────────────────
-
     def _cycle(self) -> bool:
-        """Listen once, process if wake word detected. Returns False to stop."""
         text = self._stt.listen_once()
         if not text:
             return True
 
         ui_heard(text)
 
-        if not _has_wake_word(text):
-            return True     # ignore speech not addressed to JARVIS
+        bypass = time.time() < self._bypass_until
+        if not bypass and not _has_wake_word(text):
+            return True
 
-        ui_wake()
-        command = _strip_wake_word(text)
+        if not bypass:
+            beep(880, 100)
+            ui_wake()
+            command = _strip_wake_word(text)
+        else:
+            command = text.strip()
 
         if not command:
-            # User said only the wake word — prompt for command
             self._tts.speak("Слушаю вас, сэр.")
             text2 = self._stt.listen_once()
             if not text2:
@@ -1074,14 +1303,12 @@ class JARVISMark2:
 
         return self._agent.handle(command)
 
-    # ── Main loop ─────────────────────────────────────────────────────────────
-
-    def run(self):
+    def run(self) -> None:
         signal.signal(signal.SIGINT,  self._on_signal)
         signal.signal(signal.SIGTERM, self._on_signal)
 
         if not self._stt.available:
-            ui_error("Microphone unavailable — cannot start.")
+            ui_error("Microphone unavailable — use --text.")
             self._tts.speak_sync("Сэр, микрофон недоступен.")
             return
 
@@ -1089,35 +1316,54 @@ class JARVISMark2:
         self._greet()
 
         if not GUI_OK:
-            ui_warn("pygetwindow / pyautogui not installed — window and media controls disabled.")
+            ui_warn("pygetwindow/pyautogui not installed — window tools disabled.")
 
         self._running = True
-        ui_info("Main loop running. Say a wake word to activate.")
+        ui_info("Ready. Say a wake word (or press hotkey) to activate.")
         ui_sep()
 
         while self._running:
             try:
-                should_continue = self._cycle()
-                if not should_continue:
+                if not self._cycle():
                     self._running = False
             except KeyboardInterrupt:
                 self._running = False
             except Exception as e:
-                ui_error(f"Unexpected loop error: {e}")
+                ui_error(f"Loop error: {e}")
                 log.exception("Main loop error")
-                time.sleep(1)   # anti-spin guard
+                time.sleep(1)
 
-        ui_info("Shutting down JARVIS Mark-2…")
+        ui_info("Shutting down…")
+        if self._hotkey:
+            self._hotkey.stop()
         self._tts.stop()
         ui_info("Goodbye.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  §10  ENTRY POINT
+#  §14  ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
 
-def main():
-    jarvis = JARVISMark2()
+def _parse_cli() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="JARVIS Mark-3")
+    p.add_argument("--text",     action="store_true", help="text input mode (no microphone)")
+    p.add_argument("--no-tts",   action="store_true", help="disable speech synthesis")
+    p.add_argument("--config",   default=None,        help="path to config.json")
+    p.add_argument("--model",    default=None,        help="override Ollama model")
+    return p.parse_args()
+
+
+def main() -> None:
+    global CFG
+
+    args = _parse_cli()
+    CFG = load_config(args.config)
+    if args.model:
+        CFG["ollama"]["model"] = args.model
+
+    setup_logging(CFG)
+
+    jarvis = JARVISMark3(text_mode=args.text, no_tts=args.no_tts)
     jarvis.run()
 
 

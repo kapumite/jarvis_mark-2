@@ -1,8 +1,30 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║              J.A.R.V.I.S  —  Action-Based Agent System                       ║
-║         Local LLM via Ollama · Windows 10/11 · Voice + Hotkey + Text         ║
+║              J.A.R.V.I.S  Mark-3.1  —  Action-Based Agent System            ║
+║         Local LLM via Ollama · Windows 10/11 · Voice + Hotkey + Text        ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
+
+Changelog 3.0 → 3.1:
+  FIX  ToolBox decorator crash (module-level _TOOL_REGISTRY)
+  FIX  _is_shutdown matched "выход" inside arbitrary sentences
+  FIX  _confirm_destructive false-positive on "да" inside other words
+  FIX  _extract_json non-greedy regex broke nested JSON
+  FIX  text-mode required wake word
+  FIX  _resolve_app_path static method ignored lowercased apps dict
+  FIX  focus_or_launch could not match Russian window titles
+  FIX  open_url spoke full URL with scheme; allowed file://
+  FIX  volume_up/down unbounded
+  FIX  _press_vk did not gate on sys.platform
+  FIX  TTSEngine hung if worker died
+  FIX  text-mode EOF did not exit
+  FIX  close_app did not verify process actually died
+  FIX  _has_wake_word triggered on substrings
+  NEW  _APP_ALIASES for Russian / alias window titles
+  NEW  --reset-config, --list-tools, --no-hotkey, --version
+  NEW  tools: get_battery, search_files, show_desktop, remember, recall, sleep_pc
+  NEW  TTS-friendly URL display
+  NEW  30s timeout on speak_sync
+"""
 
 import os
 import re
@@ -11,7 +33,6 @@ import json
 import time
 import copy
 import queue
-import shutil
 import signal
 import ctypes
 import logging
@@ -22,7 +43,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
-from typing import Any, Optional, Iterable
+from typing import Any, Optional
 
 # ── Hard dependencies ────────────────────────────────────────────────────────
 try:
@@ -71,14 +92,14 @@ except ImportError:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  §0  CONFIG — auto-generated, editable
+#  §0  CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
 
-_HOME    = os.path.expanduser("~")
-_LOCAL   = os.environ.get("LOCALAPPDATA", r"C:\Users\%USERNAME%\AppData\Local")
-_ROAM    = os.environ.get("APPDATA",      r"C:\Users\%USERNAME%\AppData\Roaming")
-_PF      = os.environ.get("ProgramFiles",     r"C:\Program Files")
-_PF86    = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+_HOME  = os.path.expanduser("~")
+_LOCAL = os.environ.get("LOCALAPPDATA", os.path.join(_HOME, "AppData", "Local"))
+_ROAM  = os.environ.get("APPDATA",      os.path.join(_HOME, "AppData", "Roaming"))
+_PF    = os.environ.get("ProgramFiles",     r"C:\Program Files")
+_PF86  = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
 
 DEFAULT_APPS: dict[str, str] = {
     "yandex music":  os.path.join(_LOCAL, "Programs", "YandexMusicMod", "Яндекс Музыка.exe"),
@@ -88,11 +109,26 @@ DEFAULT_APPS: dict[str, str] = {
     "firefox":       os.path.join(_PF, "Mozilla Firefox", "firefox.exe"),
     "chrome":        os.path.join(_PF, "Google", "Chrome", "Application", "chrome.exe"),
     "vs code":       os.path.join(_LOCAL, "Programs", "Microsoft VS Code", "Code.exe"),
-    "discord":       "discord:",       # protocol handler — спец-кейс
+    "discord":       "discord:",
     "spotify":       os.path.join(_ROAM, "Spotify", "Spotify.exe"),
     "notepad":       "notepad.exe",
     "explorer":      "explorer.exe",
     "calculator":    "calc.exe",
+}
+
+# Window-title aliases — used by focus_or_launch when searching for open windows
+_APP_ALIASES: dict[str, list[str]] = {
+    "yandex music":  ["Яндекс Музыка", "Yandex Music", "YandexMusic"],
+    "яндекс музыка": ["Яндекс Музыка", "Yandex Music", "YandexMusic"],
+    "steam":         ["Steam"],
+    "telegram":      ["Telegram"],
+    "firefox":       ["Firefox"],
+    "chrome":        ["Chrome", "Google Chrome"],
+    "vs code":       ["Visual Studio Code", "VS Code"],
+    "discord":       ["Discord"],
+    "spotify":       ["Spotify"],
+    "notepad":       ["Notepad", "Блокнот"],
+    "calculator":    ["Calculator", "Калькулятор"],
 }
 
 DEFAULT_CONFIG: dict = {
@@ -110,14 +146,16 @@ DEFAULT_CONFIG: dict = {
         "phrase_limit":     10.0,
     },
     "tts": {
-        "rate":  165,
-        "volume": 1.0,
+        "rate":       165,
+        "volume":     1.0,
         "voice_hint": "ru",
+        "max_wait":   30.0,
     },
     "hotkey":              "ctrl+alt+j",
     "hotkey_bypass_secs":  8.0,
     "failsafe":            True,
     "confirm_destructive": True,
+    "confirm_timeout":     15.0,
     "paths": {
         "desktop": os.path.join(_HOME, "Desktop"),
         "apps":    DEFAULT_APPS,
@@ -131,6 +169,7 @@ DEFAULT_CONFIG: dict = {
 }
 
 _CFG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+_MEM_PATH = os.path.join(os.path.dirname(_CFG_PATH), "memory.json")
 CFG: dict = {}
 
 
@@ -167,21 +206,26 @@ def load_config(explicit_path: Optional[str] = None) -> dict:
 #  §1  LOGGING
 # ══════════════════════════════════════════════════════════════════════════════
 
-log = logging.getLogger("JARVIS-Mk3")
+log = logging.getLogger("JARVIS")
 
 
 def setup_logging(cfg: dict) -> None:
     lc = cfg.get("logging", {})
     log.setLevel(getattr(logging, str(lc.get("level", "WARNING")).upper(), logging.WARNING))
+    for h in list(log.handlers):
+        log.removeHandler(h)
 
-    fh = RotatingFileHandler(
-        lc.get("file", "jarvis.log"),
-        maxBytes=lc.get("max_bytes", 5_242_880),
-        backupCount=lc.get("backups", 3),
-        encoding="utf-8",
-    )
-    fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
-    log.addHandler(fh)
+    try:
+        fh = RotatingFileHandler(
+            lc.get("file", "jarvis.log"),
+            maxBytes=lc.get("max_bytes", 5_242_880),
+            backupCount=lc.get("backups", 3),
+            encoding="utf-8",
+        )
+        fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+        log.addHandler(fh)
+    except Exception as e:
+        print(Fore.RED + f"[LOG] Cannot open log file: {e}")
 
     ch = logging.StreamHandler(sys.stderr)
     ch.setLevel(logging.ERROR)
@@ -200,7 +244,7 @@ def _ts() -> str:
 def ui_banner():
     w = 72
     print(Fore.CYAN + Style.BRIGHT + "═" * w)
-    print(Fore.CYAN + Style.BRIGHT + "  J.A.R.V.I.S  Mark-3  —  Action-Based Agent")
+    print(Fore.CYAN + Style.BRIGHT + "  J.A.R.V.I.S  Mark-3.1  —  Action-Based Agent")
     print(Fore.CYAN + Style.DIM    + f"  Model: {CFG['ollama']['model']}  |  Endpoint: {CFG['ollama']['base_url']}")
     print(Fore.CYAN + Style.BRIGHT + "═" * w)
 
@@ -228,13 +272,34 @@ def beep(freq: int = 880, dur: int = 100) -> None:
             pass
 
 
+class UserExit(Exception):
+    """Raised when user exits via EOF/Ctrl+C in text mode."""
+
+
 # ══════════════════════════════════════════════════════════════════════════════
-#  §3  TTS ENGINE
+#  §3  TOOL REGISTRY  (module-level — safe during class-body execution)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_TOOL_REGISTRY: dict[str, dict] = {}
+
+
+def tool(name: str, args: list[str], desc: str, destructive: bool = False):
+    def deco(fn):
+        _TOOL_REGISTRY[name] = {
+            "args": args, "desc": desc, "destructive": destructive,
+        }
+        return fn
+    return deco
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  §4  TTS ENGINE
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TTSEngine:
     def __init__(self, enabled: bool = True):
         self._enabled = enabled
+        self._dead    = False
         self._q: queue.Queue[Optional[str]] = queue.Queue()
         if enabled:
             threading.Thread(target=self._worker, daemon=True, name="TTS-Worker").start()
@@ -268,24 +333,29 @@ class TTSEngine:
                     self._q.task_done()
         except Exception as e:
             ui_error(f"TTS init failed: {e}")
+            self._dead = True
 
     def speak(self, text: str) -> None:
         ui_speak(text)
-        if self._enabled:
+        if self._enabled and not self._dead:
             self._q.put(text)
 
-    def speak_sync(self, text: str) -> None:
+    def speak_sync(self, text: str, timeout: Optional[float] = None) -> None:
         self.speak(text)
-        if self._enabled:
-            self._q.join()
+        if not self._enabled or self._dead:
+            return
+        # Bounded wait — never hang forever on a dead/broken worker
+        deadline = time.time() + (timeout if timeout is not None else CFG["tts"]["max_wait"])
+        while self._q.unfinished_tasks > 0 and time.time() < deadline:
+            time.sleep(0.05)
 
     def stop(self) -> None:
-        if self._enabled:
+        if self._enabled and not self._dead:
             self._q.put(None)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  §4  STT ENGINE  (mic or text)
+#  §5  STT ENGINE
 # ══════════════════════════════════════════════════════════════════════════════
 
 class STTEngine:
@@ -311,6 +381,10 @@ class STTEngine:
     def available(self) -> bool:
         return self._text_mode or self._mic is not None
 
+    @property
+    def is_text_mode(self) -> bool:
+        return self._text_mode
+
     def calibrate(self) -> None:
         if self._text_mode or not self._mic:
             return
@@ -326,9 +400,10 @@ class STTEngine:
         if self._text_mode:
             try:
                 val = input(Fore.GREEN + Style.BRIGHT + f"\n[{_ts()}] ⌨  > " + Style.RESET_ALL)
-                return val.strip() or None
             except (EOFError, KeyboardInterrupt):
-                return None
+                raise UserExit()
+            val = val.strip()
+            return val or None
 
         if not self._mic:
             return None
@@ -352,7 +427,7 @@ class STTEngine:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  §5  WIN32 MEDIA KEYS
+#  §6  WIN32 MEDIA KEYS
 # ══════════════════════════════════════════════════════════════════════════════
 
 _VK = {
@@ -365,42 +440,55 @@ _VK = {
 }
 
 
-def _press_vk(vk: int) -> None:
+def _press_vk(vk: int) -> bool:
+    if sys.platform != "win32":
+        return False
     try:
         user32 = ctypes.windll.user32
         user32.keybd_event(vk, 0, 0, 0)
         time.sleep(0.03)
         user32.keybd_event(vk, 0, 2, 0)
+        return True
     except Exception as e:
         log.warning("press_vk failed: %s", e)
+        return False
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  §6  TOOLBOX  (closed set of safe actions, auto-registered via @tool)
+#  §7  MEMORY HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _load_memory() -> dict:
+    try:
+        with open(_MEM_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_memory(data: dict) -> None:
+    try:
+        with open(_MEM_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log.warning("save_memory failed: %s", e)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  §8  TOOLBOX
 # ══════════════════════════════════════════════════════════════════════════════
 
 class ToolBox:
-    _TOOLS: dict[str, dict] = {}
-
-    @staticmethod
-    def tool(name: str, args: list[str], desc: str, destructive: bool = False):
-        def deco(fn):
-            ToolBox._TOOLS[name] = {
-                "args": args, "desc": desc, "destructive": destructive,
-            }
-            return fn
-        return deco
-
-    def __init__(self, tts: "TTSEngine"):
-        self._tts = tts
+    def __init__(self, tts: TTSEngine):
+        self._tts     = tts
         self._desktop = CFG["paths"]["desktop"]
-        self._apps    = {k.lower(): v for k, v in CFG["paths"]["apps"].items()}
+        # lowercase app keys for lookup
+        self._apps    = {k.lower().strip(): v for k, v in CFG["paths"]["apps"].items()}
 
     # ── Helpers ──────────────────────────────────────────────────────────────
 
-    @staticmethod
-    def _resolve_app_path(name: str) -> Optional[str]:
-        return CFG["paths"]["apps"].get(name.lower().strip())
+    def _resolve_app_path(self, name: str) -> Optional[str]:
+        return self._apps.get(name.lower().strip())
 
     @staticmethod
     def _find_windows(fragment: str) -> list:
@@ -415,7 +503,6 @@ class ToolBox:
 
     @staticmethod
     def _popen(path: str, *extra: str) -> bool:
-        # protocol-handler: "discord:", "ms-settings:", "https://..."
         if path.endswith(":") or "://" in path:
             try:
                 os.startfile(path)
@@ -445,6 +532,18 @@ class ToolBox:
             return [str(k).strip() for k in keys if str(k).strip()]
         return []
 
+    @staticmethod
+    def _process_running(exe: str) -> bool:
+        try:
+            r = subprocess.run(
+                ["tasklist", "/FI", f"IMAGENAME eq {exe}"],
+                capture_output=True, text=True,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            return exe.lower() in r.stdout.lower()
+        except Exception:
+            return False
+
     # ── Launch / focus / close ───────────────────────────────────────────────
 
     @tool("launch_app", ["name"], "launch an application by registry name")
@@ -460,8 +559,10 @@ class ToolBox:
 
     @tool("focus_or_launch", ["name"], "focus window if open, else launch app")
     def focus_or_launch(self, name: str) -> str:
-        if self._find_windows(name):
-            return self.focus_window(name)
+        # Try aliases first — Russian titles / alternate names
+        for alias in _APP_ALIASES.get(name.lower().strip(), [name]):
+            if self._find_windows(alias):
+                return self.focus_window(alias)
         return self.launch_app(name)
 
     @tool("focus_window", ["title"], "bring existing window to front by title fragment")
@@ -487,16 +588,18 @@ class ToolBox:
         exe = name if name.lower().endswith(".exe") else name + ".exe"
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         # graceful
-        r = subprocess.run(["taskkill", "/IM", exe],
-                           capture_output=True, text=True, creationflags=flags)
-        if r.returncode == 0:
+        subprocess.run(["taskkill", "/IM", exe],
+                       capture_output=True, text=True, creationflags=flags)
+        time.sleep(0.6)
+        if not self._process_running(exe):
             return f"{name} закрыт."
         # force
-        r = subprocess.run(["taskkill", "/F", "/IM", exe],
-                           capture_output=True, text=True, creationflags=flags)
-        if r.returncode == 0:
+        subprocess.run(["taskkill", "/F", "/IM", exe],
+                       capture_output=True, text=True, creationflags=flags)
+        time.sleep(0.3)
+        if not self._process_running(exe):
             return f"{name} закрыт принудительно."
-        return f"Не удалось закрыть {name}: {r.stderr.strip()[:80]}"
+        return f"Не удалось закрыть {name}."
 
     # ── Keyboard / text ──────────────────────────────────────────────────────
 
@@ -542,19 +645,24 @@ class ToolBox:
 
     @tool("open_url", ["url", "browser"], "open URL; browser='default'|'firefox'|'chrome'")
     def open_url(self, url: str, browser: str = "default") -> str:
+        # Reject non-http(s) schemes — no file://, no javascript:
+        if url.lower().startswith(("file:", "javascript:", "data:")):
+            return f"Схема URL запрещена: {url[:30]}…"
         if not url.startswith(("http://", "https://")):
             url = "https://" + url
+
         browser = (browser or "default").strip().lower()
         if browser not in ("", "default"):
             path = self._resolve_app_path(browser)
-            if path:
-                if self._popen(path, url):
-                    return f"Открываю {url} в {browser}."
+            if path and self._popen(path, url):
+                speak_url = re.sub(r"^https?://", "", url).rstrip("/")
+                return f"Открываю {speak_url} в {browser}."
         try:
             os.startfile(url)
-            return f"Открываю {url}."
+            speak_url = re.sub(r"^https?://", "", url).rstrip("/")
+            return f"Открываю {speak_url}."
         except Exception as e:
-            return f"Не удалось открыть {url}: {e}"
+            return f"Не удалось открыть URL: {e}"
 
     @tool("play_youtube", ["query"], "search YouTube and open in browser")
     def play_youtube(self, query: str) -> str:
@@ -648,6 +756,37 @@ class ToolBox:
         except Exception as e:
             return f"Ошибка: {e}"
 
+    @tool("search_files", ["query"], "search files on Desktop and Documents")
+    def search_files(self, query: str) -> str:
+        q = query.lower().strip()
+        if not q:
+            return "Пустой запрос."
+        dirs = [self._desktop, os.path.join(os.path.expanduser("~"), "Documents")]
+        results: list[str] = []
+        try:
+            for base in dirs:
+                if not os.path.isdir(base):
+                    continue
+                for root, subdirs, files in os.walk(base):
+                    depth = root[len(base):].count(os.sep)
+                    if depth > 3:
+                        subdirs.clear()
+                        continue
+                    for name in files + subdirs:
+                        if q in name.lower():
+                            results.append(name)
+                            if len(results) >= 8:
+                                break
+                    if len(results) >= 8:
+                        break
+                if len(results) >= 8:
+                    break
+        except Exception as e:
+            return f"Ошибка поиска: {e}"
+        if not results:
+            return f"Не найдено файлов по запросу «{query}»."
+        return "Найдено: " + "; ".join(results[:5]) + ("…" if len(results) > 5 else ".")
+
     @tool("screenshot", [], "save a screenshot to Desktop")
     def screenshot(self) -> str:
         if not GUI_OK:
@@ -677,25 +816,25 @@ class ToolBox:
         _press_vk(_VK["prevtrack"])
         return "Предыдущий трек."
 
-    @tool("volume_up", ["steps"], "increase volume (2% per step, default 5)")
-    def volume_up(self, steps: int = 5) -> str:
+    @tool("volume_up", ["steps"], "increase volume (2% per step, default 5, max 50)")
+    def volume_up(self, steps=5) -> str:
         try:
-            n = max(1, int(steps))
+            n = max(1, min(50, int(steps)))
         except (TypeError, ValueError):
             n = 5
         for _ in range(n):
             _press_vk(_VK["volumeup"])
-        return f"Громкость +{n*2}%."
+        return f"Громкость +{n * 2}%."
 
-    @tool("volume_down", ["steps"], "decrease volume (2% per step, default 5)")
-    def volume_down(self, steps: int = 5) -> str:
+    @tool("volume_down", ["steps"], "decrease volume (2% per step, default 5, max 50)")
+    def volume_down(self, steps=5) -> str:
         try:
-            n = max(1, int(steps))
+            n = max(1, min(50, int(steps)))
         except (TypeError, ValueError):
             n = 5
         for _ in range(n):
             _press_vk(_VK["volumedown"])
-        return f"Громкость −{n*2}%."
+        return f"Громкость −{n * 2}%."
 
     @tool("mute_toggle", [], "toggle mute")
     def mute_toggle(self) -> str:
@@ -728,6 +867,27 @@ class ToolBox:
         except Exception as e:
             return f"Ошибка: {e}"
 
+    @tool("sleep_pc", [], "put the computer to sleep", destructive=True)
+    def sleep_pc(self) -> str:
+        try:
+            subprocess.run(
+                ["rundll32.exe", "powrprof.dll,SetSuspendState", "0,1,0"],
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            return "Перевожу в режим сна."
+        except Exception as e:
+            return f"Ошибка: {e}"
+
+    @tool("show_desktop", [], "minimize all windows (Win+D)")
+    def show_desktop(self) -> str:
+        if not GUI_OK:
+            return "Недоступно."
+        try:
+            pyautogui.hotkey("win", "d")
+            return "Свернул все окна."
+        except Exception as e:
+            return f"Ошибка: {e}"
+
     @tool("system_stats", [], "report CPU/RAM/battery usage")
     def system_stats(self) -> str:
         if not PSUTIL_OK:
@@ -743,6 +903,19 @@ class ToolBox:
             except Exception:
                 pass
             return ", ".join(parts) + "."
+        except Exception as e:
+            return f"Ошибка: {e}"
+
+    @tool("get_battery", [], "report battery level and charging state")
+    def get_battery(self) -> str:
+        if not PSUTIL_OK:
+            return "Недоступно (нужен psutil)."
+        try:
+            b = psutil.sensors_battery()
+            if not b:
+                return "Батарея не обнаружена."
+            status = "заряжается" if b.power_plugged else "разряжается"
+            return f"Батарея {b.percent:.0f}%, {status}."
         except Exception as e:
             return f"Ошибка: {e}"
 
@@ -775,7 +948,7 @@ class ToolBox:
                   "июля", "августа", "сентября", "октября", "ноября", "декабря"]
         n = datetime.now()
         return (f"Сегодня {days[n.weekday()]}, "
-                f"{n.day} {months[n.month-1]} {n.year} года.")
+                f"{n.day} {months[n.month - 1]} {n.year} года.")
 
     @tool("set_timer", ["seconds", "label"], "set a reminder after N seconds")
     def set_timer(self, seconds, label: str = "") -> str:
@@ -791,6 +964,23 @@ class ToolBox:
         t.start()
         return f"Таймер на {secs} секунд установлен."
 
+    # ── Memory ───────────────────────────────────────────────────────────────
+
+    @tool("remember", ["key", "value"], "remember a key-value pair persistently")
+    def remember(self, key: str, value: str) -> str:
+        data = _load_memory()
+        data[key.lower().strip()] = value
+        _save_memory(data)
+        return f"Запомнил: {key} — {value}."
+
+    @tool("recall", ["key"], "recall a remembered value")
+    def recall(self, key: str) -> str:
+        data = _load_memory()
+        val = data.get(key.lower().strip())
+        if val is None:
+            return f"Не помню «{key}»."
+        return f"{key}: {val}."
+
     # ── Weather ──────────────────────────────────────────────────────────────
 
     @tool("get_weather", ["city"], "get current weather for a city")
@@ -798,7 +988,7 @@ class ToolBox:
         try:
             q = urllib.parse.quote(city.strip()) if city else ""
             url = f"https://wttr.in/{q}?format=j1&lang=ru"
-            with urllib.request.urlopen(url, timeout=6) as r:
+            with urllib.request.urlopen(url, timeout=12) as r:
                 data = json.loads(r.read().decode("utf-8", "replace"))
             cur = data["current_condition"][0]
             temp = cur["temp_C"]
@@ -814,7 +1004,7 @@ class ToolBox:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  §7  ACTION DISPATCHER
+#  §9  ACTION DISPATCHER
 # ══════════════════════════════════════════════════════════════════════════════
 
 class ActionDispatcher:
@@ -827,11 +1017,11 @@ class ActionDispatcher:
             name = (action.get("tool") or "").strip()
             args = action.get("args") or {}
 
-            if name not in ToolBox._TOOLS:
+            if name not in _TOOL_REGISTRY:
                 ui_warn(f"Unknown tool skipped: '{name}'")
                 continue
 
-            meta = ToolBox._TOOLS[name]
+            meta = _TOOL_REGISTRY[name]
             method = getattr(self._tb, name, None)
             if method is None:
                 ui_warn(f"Tool '{name}' registered but no method found.")
@@ -843,7 +1033,7 @@ class ActionDispatcher:
                 pos_args: list[Any] = []
                 for key in meta["args"]:
                     if key not in args:
-                        break  # let Python defaults handle the rest
+                        break
                     val = args[key]
                     if key == "keys":
                         pos_args.extend(ToolBox._normalize_keys(val))
@@ -864,19 +1054,19 @@ class ActionDispatcher:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  §8  SYSTEM PROMPT  (built dynamically from the tool registry)
+#  §10  SYSTEM PROMPT
 # ══════════════════════════════════════════════════════════════════════════════
 
 def build_system_prompt() -> str:
     rows = ["| tool | args | description |", "|---|---|---|"]
-    for name, meta in ToolBox._TOOLS.items():
+    for name, meta in _TOOL_REGISTRY.items():
         args = ", ".join(meta["args"]) if meta["args"] else "—"
         rows.append(f"| {name} | {args} | {meta['desc']} |")
     tools_table = "\n".join(rows)
 
     app_names = ", ".join(f'"{n}"' for n in CFG["paths"]["apps"].keys())
 
-    return f"""You are JARVIS Mark-3, a personal AI assistant on Windows.
+    return f"""You are JARVIS, a personal AI assistant on Windows.
 You speak ONLY in Russian, but you think in English when planning.
 
 ## IDENTITY
@@ -907,10 +1097,11 @@ If no action is needed (pure conversation), return "actions": [].
 - "get_time" / "get_date" return a string — the tool result will be spoken, so
   DO NOT duplicate the value in "speech"; just say "Сейчас, сэр." and let the tool speak.
 - "get_weather" city is optional; empty string = auto-detect.
-- For destructive actions (delete_folder, close_app, lock_pc) — the system
+- For destructive actions (delete_folder, close_app, lock_pc, sleep_pc) — the system
   will ask the user for confirmation, so do not add extra warnings in speech.
 - "press_key": pass a list like ["ctrl","l"] OR a string "ctrl+l".
 - "set_timer": seconds as integer, label as optional string.
+- "remember" / "recall": persist small facts between sessions.
 - Never invent tools not in the table.
 - Never include code, markdown, or commentary outside the JSON.
 
@@ -943,8 +1134,11 @@ User: "Следующий трек"
 User: "Найди в интернете рецепт борща"
 {{"speech":"Ищу, сэр.","actions":[{{"tool":"search_web","args":{{"query":"рецепт борща"}}}}]}}
 
-User: "Сделай скриншот"
-{{"speech":"Секунду, сэр.","actions":[{{"tool":"screenshot","args":{{}}}}]}}
+User: "Запомни что мой день рождения 12 мая"
+{{"speech":"Запомнил, сэр.","actions":[{{"tool":"remember","args":{{"key":"день рождения","value":"12 мая"}}}}]}}
+
+User: "Когда мой день рождения?"
+{{"speech":"Проверяю, сэр.","actions":[{{"tool":"recall","args":{{"key":"день рождения"}}}}]}}
 
 User: "Что такое квантовый компьютер?"
 {{"speech":"Квантовый компьютер использует кубиты вместо битов, сэр. Это позволяет решать определённые задачи экспоненциально быстрее классических машин.","actions":[]}}
@@ -952,7 +1146,7 @@ User: "Что такое квантовый компьютер?"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  §9  LLM PLANNER
+#  §11  LLM PLANNER
 # ══════════════════════════════════════════════════════════════════════════════
 
 class LLMPlanner:
@@ -961,7 +1155,7 @@ class LLMPlanner:
             base_url=CFG["ollama"]["base_url"],
             api_key="ollama",
         )
-        self._system = build_system_prompt()
+        self._system      = build_system_prompt()
         self._history: list[dict] = []
         self._max_history = CFG["ollama"]["max_history"]
 
@@ -969,7 +1163,7 @@ class LLMPlanner:
     def _extract_json(raw: str) -> Optional[dict]:
         text = re.sub(r"```(?:json)?", "", raw, flags=re.IGNORECASE).replace("```", "").strip()
 
-        # 1) whole-string parse
+        # 1) whole-string
         try:
             val = json.loads(text)
             if isinstance(val, dict):
@@ -977,8 +1171,18 @@ class LLMPlanner:
         except json.JSONDecodeError:
             pass
 
-        # 2) non-greedy brace match
-        m = re.search(r"\{.*?\}", text, re.DOTALL)
+        # 2) raw_decode from first '{' (handles nested braces correctly)
+        idx = text.find("{")
+        if idx >= 0:
+            try:
+                obj, _ = json.JSONDecoder().raw_decode(text[idx:])
+                if isinstance(obj, dict):
+                    return obj
+            except Exception:
+                pass
+
+        # 3) greedy brace match (last resort)
+        m = re.search(r"\{.*\}", text, re.DOTALL)
         if m:
             try:
                 val = json.loads(m.group(0))
@@ -986,16 +1190,6 @@ class LLMPlanner:
                     return val
             except json.JSONDecodeError:
                 pass
-
-        # 3) raw_decode fallback
-        try:
-            idx = text.find("{")
-            if idx >= 0:
-                obj, _ = json.JSONDecoder().raw_decode(text[idx:])
-                if isinstance(obj, dict):
-                    return obj
-        except Exception:
-            pass
 
         return None
 
@@ -1022,7 +1216,6 @@ class LLMPlanner:
 
             plan = self._extract_json(raw)
 
-            # One retry if the model failed to produce JSON
             if plan is None:
                 ui_warn("Non-JSON response — retrying once.")
                 retry_messages = messages + [
@@ -1042,12 +1235,8 @@ class LLMPlanner:
             if not isinstance(plan.get("actions"), list):
                 plan["actions"] = []
 
-            # Store a compact assistant turn
-            used_tools = [a.get("tool", "?") for a in plan["actions"] if isinstance(a, dict)]
-            summary = plan["speech"]
-            if used_tools:
-                summary += f"  [used: {', '.join(used_tools)}]"
-            self._history.append({"role": "assistant", "content": summary})
+            # Compact assistant turn — no [used: ...] pollution
+            self._history.append({"role": "assistant", "content": plan["speech"]})
 
             ui_json(plan)
             return plan
@@ -1068,27 +1257,30 @@ class LLMPlanner:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  §10  AGENT CORE
+#  §12  AGENT CORE
 # ══════════════════════════════════════════════════════════════════════════════
 
-_SHUTDOWN_PHRASES = (
-    "выключись", "отбой", "до свидания", "выход",
-    "пока джарвис", "стоп джарвис", "завершение работы",
+# Matches ONLY if the whole utterance is a shutdown phrase — no substring bugs
+_SHUTDOWN_RE = re.compile(
+    r"^\s*(выключись|отбой|выход|пока|до свидания|"
+    r"выключи джарвис|стоп джарвис|заверши работу|"
+    r"завершение работы|перейди в режим ожидания)\s*[.!?]*\s*$",
+    re.IGNORECASE,
 )
-_CANCEL_PHRASES = ("стоп", "отмена", "отставить", "хватит")
+_CANCEL_WORDS = frozenset(["стоп", "отмена", "отставить", "хватит"])
+
+_YES_WORDS = frozenset(["да", "yes", "ок", "ok", "конечно", "ага",
+                        "подтверждаю", "верно", "так", "угу", "давай", "конечно да"])
+_NO_WORDS  = frozenset(["нет", "no", "отмена", "стоп", "не",
+                        "неа", "передумал", "нет не надо", "не надо"])
 
 
 def _is_shutdown(text: str) -> bool:
-    tl = " " + text.lower().strip(" .,!?") + " "
-    for kw in _SHUTDOWN_PHRASES:
-        if f" {kw} " in tl:
-            return True
-    return False
+    return bool(_SHUTDOWN_RE.match(text))
 
 
 def _is_cancel(text: str) -> bool:
-    tl = text.lower().strip(" .,!?")
-    return tl in _CANCEL_PHRASES
+    return text.lower().strip(" .,!?") in _CANCEL_WORDS
 
 
 class AgentCore:
@@ -1100,26 +1292,37 @@ class AgentCore:
         self._dispatcher = dispatcher
         self._confirm    = CFG.get("confirm_destructive", True)
 
-    # ── Destructive confirmation ──────────────────────────────────────────────
-
     @staticmethod
     def _destructive_actions(actions: list[dict]) -> list[dict]:
         return [a for a in actions
                 if isinstance(a, dict)
-                and ToolBox._TOOLS.get(a.get("tool"), {}).get("destructive")]
+                and _TOOL_REGISTRY.get(a.get("tool", ""), {}).get("destructive")]
 
     def _confirm_destructive(self, actions: list[dict]) -> bool:
         names = ", ".join(sorted({a.get("tool", "?") for a in actions}))
         self._tts.speak_sync(
             f"Сэр, требуется подтверждение для: {names}. Скажите «да» или «нет»."
         )
-        answer = self._stt.listen_once()
+        try:
+            answer = self._stt.listen_once()
+        except UserExit:
+            return False
         if not answer:
             return False
-        al = answer.lower()
-        return any(w in al for w in ("да", "yes", "подтверждаю", "конечно", "ок"))
 
-    # ── Handle one command ────────────────────────────────────────────────────
+        al = answer.lower().strip(" .,!?")
+        # Exact match first
+        if al in _YES_WORDS:
+            return True
+        if al in _NO_WORDS:
+            return False
+        # First word only — avoids "нет, давай не надо" → True
+        first = al.split()[0] if al.split() else ""
+        if first in _YES_WORDS:
+            return True
+        if first in _NO_WORDS:
+            return False
+        return False
 
     def handle(self, text: str) -> bool:
         lower = text.lower().strip()
@@ -1134,7 +1337,6 @@ class AgentCore:
 
         ui_sep()
 
-        # Filler for slow planning
         filler = threading.Timer(1.5, lambda: self._tts.speak("Секунду, сэр…"))
         filler.daemon = True
         filler.start()
@@ -1154,7 +1356,6 @@ class AgentCore:
 
         results = self._dispatcher.run(actions) if actions else []
 
-        # Merge tool result strings into speech (unless already contained)
         extra = "  ".join(r for r in results if r and r not in speech)
         final = (speech + ("  " + extra if extra else "")).strip() or "Выполнено, сэр."
 
@@ -1163,7 +1364,7 @@ class AgentCore:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  §11  HOTKEY LISTENER
+#  §13  HOTKEY LISTENER
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _to_pynput_combo(s: str) -> str:
@@ -1173,8 +1374,6 @@ def _to_pynput_combo(s: str) -> str:
 
 
 class HotkeyListener:
-    """Press hotkey → bypass wake word for the next N seconds."""
-
     def __init__(self, on_trigger):
         self._listener = None
         if not PYNPUT_OK:
@@ -1198,12 +1397,15 @@ class HotkeyListener:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  §12  WAKE WORD
+#  §14  WAKE WORD
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _has_wake_word(text: str) -> bool:
     tl = text.lower()
-    return any(ww in tl for ww in CFG["wake_words"])
+    for ww in CFG["wake_words"]:
+        if re.search(rf"\b{re.escape(ww)}\b", tl):
+            return True
+    return False
 
 
 def _strip_wake_word(text: str) -> str:
@@ -1216,11 +1418,11 @@ def _strip_wake_word(text: str) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  §13  MAIN ORCHESTRATOR
+#  §15  MAIN ORCHESTRATOR
 # ══════════════════════════════════════════════════════════════════════════════
 
-class JARVISMark3:
-    def __init__(self, text_mode: bool = False, no_tts: bool = False):
+class JARVIS:
+    def __init__(self, text_mode: bool = False, no_tts: bool = False, no_hotkey: bool = False):
         ui_banner()
 
         if GUI_OK and CFG.get("failsafe", True):
@@ -1246,7 +1448,7 @@ class JARVISMark3:
 
         self._bypass_until = 0.0
         self._hotkey: Optional[HotkeyListener] = None
-        if not text_mode:
+        if not text_mode and not no_hotkey:
             self._hotkey = HotkeyListener(self._on_hotkey)
 
         self._running = False
@@ -1271,20 +1473,27 @@ class JARVISMark3:
         )
         ww = " или ".join(f"«{w}»" for w in CFG["wake_words"][:2])
         ui_info(f"Wake words: {ww}")
-        self._tts.speak_sync(
-            f"{greeting}, сэр. JARVIS Mark-3 в сети. Ожидаю команд."
-        )
+        self._tts.speak_sync(f"{greeting}, сэр. JARVIS в сети. Ожидаю команд.")
 
     def _cycle(self) -> bool:
-        text = self._stt.listen_once()
+        try:
+            text = self._stt.listen_once()
+        except UserExit:
+            ui_info("EOF — exiting.")
+            return False
+
         if not text:
             return True
 
         ui_heard(text)
 
-        bypass = time.time() < self._bypass_until
-        if not bypass and not _has_wake_word(text):
-            return True
+        # Text mode: never require wake word
+        if self._stt.is_text_mode:
+            bypass = True
+        else:
+            bypass = time.time() < self._bypass_until
+            if not bypass and not _has_wake_word(text):
+                return True
 
         if not bypass:
             beep(880, 100)
@@ -1295,7 +1504,10 @@ class JARVISMark3:
 
         if not command:
             self._tts.speak("Слушаю вас, сэр.")
-            text2 = self._stt.listen_once()
+            try:
+                text2 = self._stt.listen_once()
+            except UserExit:
+                return False
             if not text2:
                 return True
             ui_heard(text2)
@@ -1326,6 +1538,8 @@ class JARVISMark3:
             try:
                 if not self._cycle():
                     self._running = False
+            except UserExit:
+                self._running = False
             except KeyboardInterrupt:
                 self._running = False
             except Exception as e:
@@ -1341,15 +1555,19 @@ class JARVISMark3:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  §14  ENTRY POINT
+#  §16  ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _parse_cli() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="JARVIS Mark-3")
-    p.add_argument("--text",     action="store_true", help="text input mode (no microphone)")
-    p.add_argument("--no-tts",   action="store_true", help="disable speech synthesis")
-    p.add_argument("--config",   default=None,        help="path to config.json")
-    p.add_argument("--model",    default=None,        help="override Ollama model")
+    p = argparse.ArgumentParser(description="JARVIS Mark-3.1")
+    p.add_argument("--text",         action="store_true", help="text input mode (no microphone)")
+    p.add_argument("--no-tts",       action="store_true", help="disable speech synthesis")
+    p.add_argument("--no-hotkey",    action="store_true", help="disable global hotkey")
+    p.add_argument("--config",       default=None,        help="path to config.json")
+    p.add_argument("--reset-config", action="store_true", help="reset config.json to defaults")
+    p.add_argument("--list-tools",   action="store_true", help="print registered tools and exit")
+    p.add_argument("--model",        default=None,        help="override Ollama model")
+    p.add_argument("--version",      action="version",    version="JARVIS Mark-3.1")
     return p.parse_args()
 
 
@@ -1357,13 +1575,30 @@ def main() -> None:
     global CFG
 
     args = _parse_cli()
+
+    if args.reset_config:
+        try:
+            if os.path.exists(_CFG_PATH):
+                os.remove(_CFG_PATH)
+                print(Fore.YELLOW + f"[CFG] Removed: {_CFG_PATH}")
+        except Exception as e:
+            print(Fore.RED + f"[CFG] Cannot reset: {e}")
+
     CFG = load_config(args.config)
     if args.model:
         CFG["ollama"]["model"] = args.model
 
     setup_logging(CFG)
 
-    jarvis = JARVISMark3(text_mode=args.text, no_tts=args.no_tts)
+    if args.list_tools:
+        print(Fore.CYAN + f"Registered tools ({len(_TOOL_REGISTRY)}):")
+        for name, meta in _TOOL_REGISTRY.items():
+            args_str = ", ".join(meta["args"]) if meta["args"] else "—"
+            flag = Fore.RED + " [destructive]" + Fore.RESET if meta["destructive"] else ""
+            print(f"  {Fore.GREEN}{name}{Fore.RESET}({args_str}) — {meta['desc']}{flag}")
+        return
+
+    jarvis = JARVIS(text_mode=args.text, no_tts=args.no_tts, no_hotkey=args.no_hotkey)
     jarvis.run()
 
 
